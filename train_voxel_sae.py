@@ -66,7 +66,7 @@ if __name__ == "__main__":
 
             mse_loss = mse_scale * mse(voxels_hat, voxels, reduction="none").sum(-1)
             weighted_latents = latents * sae.W_dec.norm(dim=1)
-            sparsity = weighted_latents.norm(p=1, dim=-1)  # sum over the feature dimension
+            sparsity = weighted_latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
             total_l1 += sparsity.mean().cpu().detach().numpy()
