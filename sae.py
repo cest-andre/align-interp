@@ -1,0 +1,169 @@
+import torch
+from torch import nn
+import numpy as np
+
+
+def LN(x: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mu = x.mean(dim=-1, keepdim=True)
+    x = x - mu
+    std = x.std(dim=-1, keepdim=True)
+    x = x / (std + eps)
+    return x, mu, std
+
+
+class SAE(nn.Module):
+    def __init__(self, input_dims, expansion=32, dtype=torch.float64, device="cuda", topk=None, auxk=None, dead_steps_threshold=None, squeeze=10):
+        super().__init__()
+
+        self.input_dims = input_dims
+        self.output_dims = input_dims
+        self.num_latents = input_dims * expansion
+        self.dtype = dtype
+        self.device = device
+        self.squeeze = squeeze
+        self.topk = topk
+
+        self.init_weights()
+
+        self.auxk = auxk
+        self.dead_steps_threshold = dead_steps_threshold
+
+        def auxk_mask_fn(x):
+            dead_mask = self.stats_last_nonzero > self.dead_steps_threshold
+            x.data *= dead_mask
+            return x
+
+        self.auxk_mask_fn = auxk_mask_fn
+        self.register_buffer("stats_last_nonzero", torch.zeros(self.num_latents, dtype=torch.long))
+
+    def init_weights(self):
+        self.b_enc = nn.Parameter(
+            torch.zeros(self.num_latents, dtype=self.dtype, device=self.device)
+        )
+
+        self.W_dec = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(
+                    self.num_latents, self.output_dims, dtype=self.dtype, device=self.device
+                )
+            )
+        )
+
+        self.W_enc = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(
+                    self.input_dims, self.num_latents, dtype=self.dtype, device=self.device
+                )
+            )
+        )
+
+        self.b_dec = nn.Parameter(
+            torch.zeros(self.output_dims, dtype=self.dtype, device=self.device)
+        )
+
+    def encode(self, x):
+        preact_feats = x @ self.W_enc + self.b_enc
+        top_dead_acts = None
+        num_dead = torch.tensor(0)
+
+        if self.topk is not None:
+            topk_res = torch.topk(preact_feats, k=self.topk, dim=-1)
+            values = nn.ReLU()(topk_res.values)
+            x = torch.zeros_like(preact_feats)
+            x.scatter_(-1, topk_res.indices, values)
+
+            self.stats_last_nonzero *= (x == 0).all(dim=0).long()
+            self.stats_last_nonzero += 1
+
+            auxk_acts = self.auxk_mask_fn(preact_feats)
+            #   TODO: ensure all batch entries have at least auxk nonzero (dead) acts.
+            #   On second thought, do I even need to check this?  As there are so many latents,
+            #   and only k can fire each batch, perhaps it's fairly likely that at least 512
+            #   do not fire for the first epoch.
+            if (torch.sum(auxk_acts != 0, dim=-1) >= self.auxk).all(dim=0):
+                num_dead = torch.mean(torch.sum(auxk_acts != 0, dim=-1).type(torch.float))
+                deadk_res = torch.topk(auxk_acts, k=self.auxk, dim=-1)
+                top_dead_acts = torch.zeros_like(auxk_acts)
+                top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
+                top_dead_acts = nn.ReLU()(top_dead_acts)
+
+        return nn.ReLU()(x), top_dead_acts, num_dead
+
+    def decode(self, x, mu, std):
+        x = x @ self.W_dec + self.b_dec
+        x = x * std + mu
+        return x
+
+    def forward(self, x):
+        dead_acts_recon = None
+        x, mu, std = LN(x)
+
+        latents, top_dead_acts, num_dead = self.encode(x)
+        out = self.decode(latents, mu, std)
+
+        if top_dead_acts is not None:
+            dead_acts_recon = self.decode(top_dead_acts, mu, std)
+
+        return latents, out, dead_acts_recon, num_dead
+
+
+#   Wrapper so that we have control over the forward pass.
+class ModelWrapper(nn.Module):
+    target_neuron = None
+    all_acts = []
+
+    def __init__(self, resnet, expansion, device, use_sae=False, input_dims=None):
+        super().__init__()
+        self.device = device
+
+        self.block_input = nn.Sequential()
+        self.block_input.append(resnet.conv1)
+        self.block_input.append(resnet.bn1)
+        self.block_input.append(resnet.relu)
+        self.block_input.append(resnet.maxpool)
+        self.block_input.append(resnet.layer1)
+        self.block_input.append(resnet.layer2)
+
+        self.block_input.append(resnet.layer3[:5])
+        self.block_output = nn.Sequential()
+        self.block_output.append(resnet.layer3[5].conv1)
+        self.block_output.append(resnet.layer3[5].bn1)
+        self.block_output.append(resnet.layer3[5].relu)
+        self.block_output.append(resnet.layer3[5].conv2)
+        self.block_output.append(resnet.layer3[5].bn2)
+        self.block_output.append(resnet.layer3[5].relu)
+        self.block_output.append(resnet.layer3[5].conv3)
+        self.block_output.append(resnet.layer3[5].bn3)
+
+        # self.block_input.append(resnet.layer3)
+        # self.block_input.append(resnet.layer4[0])
+        # self.block_input.append(resnet.layer4[1].conv1)
+        # self.block_input.append(resnet.layer4[1].bn1)
+        # self.block_input.append(resnet.layer4[1].relu)
+        # self.block_input.append(resnet.layer4[1].conv2)
+        # self.block_input.append(resnet.layer4[1].bn2)
+
+        self.use_sae = use_sae
+        if self.use_sae:
+            assert input_dims != None
+            self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
+
+    def forward(self, x):
+        x = x.to(self.device)
+        x = self.block_input(x)
+
+        presum_out = self.block_output(x)
+        x = x + presum_out
+
+        x = nn.ReLU(inplace=True)(x)
+
+        if self.use_gcc:
+            center_coord = x.shape[-1] // 2
+            x = x[:, :, center_coord, center_coord]
+
+            # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
+
+            x = self.map(x)
+            x = x[:, :, None, None]
+
+        return x

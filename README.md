@@ -1,2 +1,4 @@
 # align-interp
-Interpretable Neural Alignment
+Under development.
+
+Project is to perform neural alignment over more interpretable bases of the two systems, which may include DNNs and/or the brain.  This will start with the visual domain using Natural Scenes Dataset.  Goals of the project include an increased understanding of the representations shared between two systems, and which representations are unique to each.  In addition, by repeating DNN->brain alignment across a zoo of DNNs, we hope to find representations in the brain which no DNN possesses.  By doing so, we hope this can be informative on what DNNs are missing in order to become more brain-like.
