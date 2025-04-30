@@ -115,6 +115,7 @@ class ModelWrapper(nn.Module):
     def __init__(self, resnet, expansion, device, use_sae=False, input_dims=None):
         super().__init__()
         self.device = device
+        self.block_output = None
 
         self.block_input = nn.Sequential()
         self.block_input.append(resnet.conv1)
@@ -148,14 +149,16 @@ class ModelWrapper(nn.Module):
             assert input_dims != None
             self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, relu=False):
         x = x.to(self.device)
         x = self.block_input(x)
 
-        presum_out = self.block_output(x)
-        x = x + presum_out
+        if self.block_output is not None:
+            presum_out = self.block_output(x)
+            x = x + presum_out
 
-        x = nn.ReLU(inplace=True)(x)
+        if relu:
+            x = nn.ReLU(inplace=True)(x)
 
         if self.use_gcc:
             center_coord = x.shape[-1] // 2

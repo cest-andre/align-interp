@@ -16,7 +16,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--expansion', type=int, default=32)
     parser.add_argument('--topk', type=int, default=32)
-    parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -28,13 +28,13 @@ if __name__ == "__main__":
     dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=True)
     input_dims = voxel_data[0].shape[-1]
 
-    sae = SAE(input_dims, args.expansion, topk=args.topk if args.topk > 0 else None, auxk=2048, dead_steps_threshold=16, device='cpu').to(device)
+    sae = SAE(input_dims, args.expansion, topk=args.topk if args.topk > 0 else None, auxk=2048, dead_steps_threshold=64, device='cpu').to(device)
     # sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{10}ep.pth"))
 
     lr=0.0004
-    adam_beta1=0.9 
+    adam_beta1=0.9
     adam_beta2=0.999
-    aux_alpha = 100
+    aux_alpha = 10
     label = f'top{args.topk}_{aux_alpha}aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
 
     mse_scale = (
