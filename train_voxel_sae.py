@@ -16,6 +16,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--expansion', type=int, default=32)
     parser.add_argument('--topk', type=int, default=32)
+    parser.add_argument('--num_voxels', type=int, default=5931)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
@@ -28,14 +29,14 @@ if __name__ == "__main__":
     dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=True)
     input_dims = voxel_data[0].shape[-1]
 
-    sae = SAE(input_dims, args.expansion, topk=args.topk if args.topk > 0 else None, auxk=2048, dead_steps_threshold=64, device='cpu').to(device)
+    sae = SAE(args.num_voxels, args.expansion, topk=args.topk if args.topk > 0 else None, auxk=128, dead_steps_threshold=16, device='cpu', enc_data=None).to(device)
     # sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{10}ep.pth"))
 
     lr=0.0004
     adam_beta1=0.9
     adam_beta2=0.999
-    aux_alpha = 10
-    label = f'top{args.topk}_{aux_alpha}aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    aux_alpha = 256
+    label = f'top{args.topk}_{args.num_voxels}subset_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
 
     mse_scale = (
         1 / ((voxel_data.float().mean(dim=0) - voxel_data.float()) ** 2).mean()
@@ -61,7 +62,7 @@ if __name__ == "__main__":
         for i, voxels in enumerate(dataloader, 0):
             optimizer.zero_grad()
 
-            voxels = voxels[0].to(device)
+            voxels = voxels[0][:, :args.num_voxels].to(device)
             latents, voxels_hat, dead_voxels_recon, num_dead = sae(voxels)
 
             mse_loss = mse_scale * mse(voxels_hat, voxels, reduction="none").sum(-1)
@@ -94,7 +95,7 @@ if __name__ == "__main__":
 
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 10 == 0:
+        if (ep+1) % 100 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
         
     np.save(f"{args.ckpt_dir}/{label}_sae_maes_{ep+1}.npy", np.array(all_mses))

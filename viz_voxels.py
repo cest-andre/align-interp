@@ -24,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument('--savedir', type=str)
     parser.add_argument('--subj_id', type=int)
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--num_voxels', type=int, default=5931)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
@@ -39,7 +40,7 @@ if __name__ == "__main__":
     im_count = 0
     all_latent_acts = []
     for i, voxels in enumerate(dataloader):
-        voxels = voxels[0].to(device)
+        voxels = voxels[0][:, :args.num_voxels].to(device)
         im_count += voxels.shape[0]
 
         latent_acts = voxels @ latent_weights
@@ -54,7 +55,7 @@ if __name__ == "__main__":
 
     for i in range(32):
         latent_acts = all_latent_acts[i]
-        _, sorted_idx = zip(*sorted(zip(latent_acts.tolist(), all_idx), reverse=True))
+        sorted_acts, sorted_idx = zip(*sorted(zip(latent_acts.tolist(), all_idx), reverse=True))
         sorted_idx = np.array(sorted_idx)
 
         save_top_cocos(args.coco_dir, coco_ids[sorted_idx[:9]], i, savedir, save_inh=False)

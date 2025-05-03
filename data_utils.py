@@ -44,7 +44,7 @@ def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, save_inh=False):
 
 
 def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
-    shared_ids = pickle.load(open(split_ids_path, 'rb'))['test']  #  test contains the 1k coco images shared across subjects
+    shared_ids = pickle.load(open(split_ids_path, 'rb'))['train']  #  test contains the 1k coco images shared across subjects
     all_voxels = pickle.load(open(nsd_path, 'rb'))
 
     coco_ids = []
@@ -57,7 +57,6 @@ def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
 
     coco_ids = np.array(coco_ids)
     subj_voxels = np.array(subj_voxels)
-    print(subj_voxels.shape)
     
     return coco_ids, subj_voxels
 

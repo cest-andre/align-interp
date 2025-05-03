@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import numpy as np
+import math
 
 
 def LN(x: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -12,7 +13,7 @@ def LN(x: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor, 
 
 
 class SAE(nn.Module):
-    def __init__(self, input_dims, expansion=32, dtype=torch.float64, device="cuda", topk=None, auxk=None, dead_steps_threshold=None, squeeze=10):
+    def __init__(self, input_dims, expansion=32, dtype=torch.float64, device="cuda", topk=None, auxk=None, dead_steps_threshold=None, enc_data=None):
         super().__init__()
 
         self.input_dims = input_dims
@@ -20,10 +21,9 @@ class SAE(nn.Module):
         self.num_latents = input_dims * expansion
         self.dtype = dtype
         self.device = device
-        self.squeeze = squeeze
         self.topk = topk
 
-        self.init_weights()
+        self.init_weights(enc_data=enc_data)
 
         self.auxk = auxk
         self.dead_steps_threshold = dead_steps_threshold
@@ -36,11 +36,7 @@ class SAE(nn.Module):
         self.auxk_mask_fn = auxk_mask_fn
         self.register_buffer("stats_last_nonzero", torch.zeros(self.num_latents, dtype=torch.long))
 
-    def init_weights(self):
-        self.b_enc = nn.Parameter(
-            torch.zeros(self.num_latents, dtype=self.dtype, device=self.device)
-        )
-
+    def init_weights(self, enc_data=None):
         self.W_dec = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(
@@ -49,16 +45,41 @@ class SAE(nn.Module):
             )
         )
 
-        self.W_enc = nn.Parameter(
-            torch.nn.init.kaiming_uniform_(
-                torch.empty(
-                    self.input_dims, self.num_latents, dtype=self.dtype, device=self.device
-                )
-            )
-        )
-
         self.b_dec = nn.Parameter(
             torch.zeros(self.output_dims, dtype=self.dtype, device=self.device)
+        )
+
+        #   enc_data is a tensor subset of training data ideally with shape: (num_latents, input_dims).
+        #   Subset would be taken in training code.  If dataset is too small, the entire set should be passed,
+        #   and it will be duplicated to match the number of sae latents.
+        if enc_data is not None:
+            kaiming_bound = torch.max(self.W_dec)
+            enc_data, _, _ = LN(enc_data)
+
+            data_min = torch.min(enc_data, dim=1).values
+            data_min = data_min[:, None].broadcast_to(enc_data.shape)
+
+            data_max = torch.max(enc_data, dim=1).values
+            data_max = data_max[:, None].broadcast_to(enc_data.shape)
+
+            enc_data = (((enc_data - data_min) / (data_max - data_min)) * kaiming_bound) - kaiming_bound
+            if enc_data.shape[0] < self.num_latents:
+                #  duplicate enc_data examples to match num_latents
+                enc_data = enc_data[None, :, :].broadcast_to((math.ceil(self.num_latents / enc_data.shape[0]), enc_data.shape[0], enc_data.shape[1]))
+                self.W_enc = nn.Parameter(torch.flatten(enc_data, end_dim=1)[:self.num_latents].T)
+            else:
+                self.W_enc = nn.Parameter(enc_data.T)
+        else:
+            self.W_enc = nn.Parameter(
+                torch.nn.init.kaiming_uniform_(
+                    torch.empty(
+                        self.input_dims, self.num_latents, dtype=self.dtype, device=self.device
+                    )
+                )
+            )
+
+        self.b_enc = nn.Parameter(
+            torch.zeros(self.num_latents, dtype=self.dtype, device=self.device)
         )
 
     def encode(self, x):
