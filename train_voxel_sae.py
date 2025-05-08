@@ -27,8 +27,12 @@ if __name__ == "__main__":
 
     voxel_data = np.load(args.voxel_path)
     voxel_data = torch.tensor(voxel_data)
-    if args.num_voxels > 0 and args.num_voxels < voxel_data.shape[1]:
-        voxel_data = voxel_data[:, torch.randperm(voxel_data.shape[1])[:args.num_voxels]]
+
+    num_voxels = args.num_voxels
+    if num_voxels > 0 and num_voxels < voxel_data.shape[1]:
+        voxel_data = voxel_data[:, torch.randperm(voxel_data.shape[1])[:num_voxels]]
+    else:
+        num_voxels = voxel_data.shape[1]
 
     voxel_ds = TensorDataset(voxel_data)
     dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
@@ -36,16 +40,20 @@ if __name__ == "__main__":
     lr=0.0004
     adam_beta1=0.9
     adam_beta2=0.999
-    aux_alpha = 256
-    label = f'top{args.topk}_{args.num_voxels}subset_rand_{aux_alpha}aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
-
-    sae = SAE(args.num_voxels, args.expansion, topk=args.topk if args.topk > 0 else None, auxk=512, dead_steps_threshold=64, device='cpu', enc_data=None).to(device)
-    if args.start_epoch > 0:
-        sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
-
+    aux_alpha = 1024
     mse_scale = (
         1 / ((voxel_data.float().mean(dim=0) - voxel_data.float()) ** 2).mean()
     )
+
+    sae = SAE(
+        num_voxels,
+        args.expansion,
+        topk=args.topk if args.topk > 0 else None,
+        auxk=2048,
+        dead_steps_threshold=4,
+        device='cpu',
+        enc_data=voxel_data
+    ).to(device)
 
     optimizer = optim.Adam(
         sae.parameters(),
@@ -56,6 +64,11 @@ if __name__ == "__main__":
         ),
         eps=6.25e-10
     )
+
+    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_datainit_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    if args.start_epoch > 0:
+        sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
+        optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
 
     all_mses = []
     mse = torch.nn.functional.mse_loss
@@ -90,7 +103,6 @@ if __name__ == "__main__":
 
             loss = loss.mean()
             loss.backward()
-
             optimizer.step()
 
         print(f"Average mse:  {total_mse / i}")
@@ -100,7 +112,8 @@ if __name__ == "__main__":
 
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 100 == 0:
+        if (ep+1) % 250 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
+            torch.save(optimizer.state_dict(), f"{args.ckpt_dir}/{label}_opt_states_{ep+1}ep.pth")
         
     np.save(f"{args.ckpt_dir}/{label}_sae_maes_{ep+1}.npy", np.array(all_mses))
