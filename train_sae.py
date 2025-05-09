@@ -10,14 +10,14 @@ from sae import SAE
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--voxel_path', type=str)
+    parser.add_argument('--acts_path', type=str)
     parser.add_argument('--ckpt_dir', type=str)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--start_epoch', type=int, default=0)
     parser.add_argument('--expansion', type=int, default=32)
     parser.add_argument('--topk', type=int, default=32)
-    parser.add_argument('--num_voxels', type=int, default=0)
+    parser.add_argument('--num_input_dims', type=int, default=0)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
     assert args.start_epoch < args.epochs
@@ -25,34 +25,34 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 
-    voxel_data = np.load(args.voxel_path)
-    voxel_data = torch.tensor(voxel_data)
+    acts_data = np.load(args.acts_path)
+    acts_data = torch.tensor(acts_data)
 
-    num_voxels = args.num_voxels
-    if num_voxels > 0 and num_voxels < voxel_data.shape[1]:
-        voxel_data = voxel_data[:, torch.randperm(voxel_data.shape[1])[:num_voxels]]
+    num_dims = args.num_input_dims
+    if num_dims > 0 and num_dims < acts_data.shape[1]:
+        acts_data = acts_data[:, torch.randperm(acts_data.shape[1])[:num_dims]]
     else:
-        num_voxels = voxel_data.shape[1]
+        num_dims = acts_data.shape[1]
 
-    voxel_ds = TensorDataset(voxel_data)
-    dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    acts_ds = TensorDataset(acts_data)
+    dataloader = DataLoader(acts_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     lr=0.0004
     adam_beta1=0.9
     adam_beta2=0.999
     aux_alpha = 1024
     mse_scale = (
-        1 / ((voxel_data.float().mean(dim=0) - voxel_data.float()) ** 2).mean()
+        1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
 
     sae = SAE(
-        num_voxels,
+        num_dims,
         args.expansion,
         topk=args.topk if args.topk > 0 else None,
         auxk=2048,
-        dead_steps_threshold=4,
+        dead_steps_threshold=8,
         device='cpu',
-        enc_data=voxel_data
+        enc_data=acts_data
     ).to(device)
 
     optimizer = optim.Adam(
@@ -77,13 +77,13 @@ if __name__ == "__main__":
         total_mse = 0
         total_l1 = 0
         total_dead = 0
-        for i, voxels in enumerate(dataloader, 0):
+        for i, acts in enumerate(dataloader, 0):
             optimizer.zero_grad()
 
-            voxels = voxels[0].to(device)
-            latents, voxels_hat, dead_voxels_recon, num_dead = sae(voxels)
+            acts = acts[0].to(device)
+            latents, acts_hat, dead_acts_recon, num_dead = sae(acts)
 
-            mse_loss = mse_scale * mse(voxels_hat, voxels, reduction="none").sum(-1)
+            mse_loss = mse_scale * mse(acts_hat, acts, reduction="none").sum(-1)
             weighted_latents = latents * sae.W_dec.norm(dim=1)
             sparsity = weighted_latents.norm(p=1, dim=-1)
 
@@ -94,9 +94,9 @@ if __name__ == "__main__":
             loss = mse_loss
 
             #  Auxiliary loss (prevents dead latents)
-            if dead_voxels_recon is not None:
-                error = voxels - voxels_hat
-                aux_mse = mse(dead_voxels_recon, error, reduction="none").sum(-1) / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
+            if dead_acts_recon is not None:
+                error = acts - acts_hat
+                aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1) / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
                 aux_loss = aux_alpha * aux_mse.nan_to_num(0)
 
                 loss += aux_loss

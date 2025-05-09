@@ -133,37 +133,37 @@ class ModelWrapper(nn.Module):
     target_neuron = None
     all_acts = []
 
-    def __init__(self, resnet, expansion, device, use_sae=False, input_dims=None):
+    def __init__(self, model, expansion, device, use_sae=False, input_dims=None):
         super().__init__()
         self.device = device
         self.block_output = None
 
         self.block_input = nn.Sequential()
-        self.block_input.append(resnet.conv1)
-        self.block_input.append(resnet.bn1)
-        self.block_input.append(resnet.relu)
-        self.block_input.append(resnet.maxpool)
-        self.block_input.append(resnet.layer1)
-        self.block_input.append(resnet.layer2)
+        self.block_input.append(model.conv1)
+        self.block_input.append(model.bn1)
+        self.block_input.append(model.relu)
+        self.block_input.append(model.maxpool)
+        self.block_input.append(model.layer1)
+        self.block_input.append(model.layer2)
 
-        self.block_input.append(resnet.layer3[:5])
-        self.block_output = nn.Sequential()
-        self.block_output.append(resnet.layer3[5].conv1)
-        self.block_output.append(resnet.layer3[5].bn1)
-        self.block_output.append(resnet.layer3[5].relu)
-        self.block_output.append(resnet.layer3[5].conv2)
-        self.block_output.append(resnet.layer3[5].bn2)
-        self.block_output.append(resnet.layer3[5].relu)
-        self.block_output.append(resnet.layer3[5].conv3)
-        self.block_output.append(resnet.layer3[5].bn3)
+        # self.block_input.append(model.layer3[:5])
+        # self.block_output = nn.Sequential()
+        # self.block_output.append(model.layer3[5].conv1)
+        # self.block_output.append(model.layer3[5].bn1)
+        # self.block_output.append(model.layer3[5].relu)
+        # self.block_output.append(model.layer3[5].conv2)
+        # self.block_output.append(model.layer3[5].bn2)
+        # self.block_output.append(model.layer3[5].relu)
+        # self.block_output.append(model.layer3[5].conv3)
+        # self.block_output.append(model.layer3[5].bn3)
 
-        # self.block_input.append(resnet.layer3)
-        # self.block_input.append(resnet.layer4[0])
-        # self.block_input.append(resnet.layer4[1].conv1)
-        # self.block_input.append(resnet.layer4[1].bn1)
-        # self.block_input.append(resnet.layer4[1].relu)
-        # self.block_input.append(resnet.layer4[1].conv2)
-        # self.block_input.append(resnet.layer4[1].bn2)
+        self.block_input.append(model.layer3)
+        self.block_input.append(model.layer4[0])
+        self.block_input.append(model.layer4[1].conv1)
+        self.block_input.append(model.layer4[1].bn1)
+        self.block_input.append(model.layer4[1].relu)
+        self.block_input.append(model.layer4[1].conv2)
+        self.block_input.append(model.layer4[1].bn2)
 
         self.use_sae = use_sae
         if self.use_sae:
@@ -181,7 +181,7 @@ class ModelWrapper(nn.Module):
         if relu:
             x = nn.ReLU(inplace=True)(x)
 
-        if self.use_gcc:
+        if self.use_sae:
             center_coord = x.shape[-1] // 2
             x = x[:, :, center_coord, center_coord]
 
