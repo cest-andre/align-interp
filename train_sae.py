@@ -12,6 +12,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--acts_path', type=str)
     parser.add_argument('--ckpt_dir', type=str)
+    parser.add_argument('--relu', action='store_true', default=False)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--start_epoch', type=int, default=0)
@@ -27,6 +28,8 @@ if __name__ == "__main__":
 
     acts_data = np.load(args.acts_path)
     acts_data = torch.tensor(acts_data)
+    if args.relu:
+        acts_data = torch.clamp(acts_data, min=0)
 
     num_dims = args.num_input_dims
     if num_dims > 0 and num_dims < acts_data.shape[1]:
@@ -40,7 +43,7 @@ if __name__ == "__main__":
     lr=0.0004
     adam_beta1=0.9
     adam_beta2=0.999
-    aux_alpha = 1024
+    aux_alpha = 10
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -49,10 +52,10 @@ if __name__ == "__main__":
         num_dims,
         args.expansion,
         topk=args.topk if args.topk > 0 else None,
-        auxk=2048,
-        dead_steps_threshold=8,
+        auxk=64,
+        dead_steps_threshold=4,
         device='cpu',
-        enc_data=acts_data
+        enc_data=None
     ).to(device)
 
     optimizer = optim.Adam(
@@ -65,7 +68,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_datainit_{args.expansion}exp' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_kmeans_filtered' if args.topk > 0 else f'vanilla_{args.expansion}exp'
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))

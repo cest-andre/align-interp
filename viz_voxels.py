@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
-from data_utils import extract_shared_for_subj, save_top_cocos
+from voxel_utils import extract_shared_for_subj, save_top_cocos
 
 
 #   TODO: Create dataloader from voxel_data and compute latent acts via dot product of voxel responses and latent's decoder weights.
@@ -25,6 +25,7 @@ if __name__ == "__main__":
     parser.add_argument('--subj_id', type=int)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--num_voxels', type=int, default=0)
+    parser.add_argument('--filter_path', type=str, default=None)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
@@ -33,6 +34,9 @@ if __name__ == "__main__":
 
     coco_ids, voxel_data = extract_shared_for_subj(args.splits_path, args.nsd_path, args.subj_id)
     voxel_data = torch.tensor(voxel_data)
+    if args.filter_path is not None:
+        voxel_data = voxel_data[:, np.load(args.filter_path)]
+        
     if args.num_voxels > 0 and args.num_voxels < voxel_data.shape[1]:
         voxel_data = voxel_data[:, torch.randperm(voxel_data.shape[1])[:args.num_voxels]]
 

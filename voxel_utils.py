@@ -45,7 +45,7 @@ def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, save_inh=False):
 
 
 def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
-    shared_ids = pickle.load(open(split_ids_path, 'rb'))['train']  #  test contains the 1k coco images shared across subjects
+    shared_ids = pickle.load(open(split_ids_path, 'rb'))['train']  #  'test' contains the 1k coco images shared across subjects
     all_voxels = pickle.load(open(nsd_path, 'rb'))
 
     coco_ids = []
@@ -73,36 +73,28 @@ def extract_train_for_subj(split_ids_path, nsd_path, savedir, subj_id):
             subj_voxels.append(voxels)
 
     subj_voxels = np.array(subj_voxels)
-    print(subj_voxels.shape)
-    np.save(os.path.join(savedir, f'subj_{subj_id}_train_voxels.npy'), subj_voxels)
+    # np.save(os.path.join(savedir, f'subj_{subj_id}_{"" if filtered_idx is None else "kmeans_filtered_"}train_voxels.npy'), subj_voxels)
+    return subj_voxels
 
 
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
 #   Set k to the desired number of voxels to be extracted.  After kmeans is complete, each centroid is a tuning curve, so take corrs
 #   of all voxel tuning curves with that to obtain the best voxel match for that centroid. 
-def kmeans_voxel_reduce(nsd_dir, savedir, k=128, num_subjects=8):
-    all_subj_idx = []
-    for i in range(num_subjects):
-        voxels = np.load(os.path.join(nsd_dir, f'subj{i+1}.npy'))
-        voxels = np.transpose(voxels)  #  very important as we want voxels to be our samples in "NSD activation space" to find redundancies.
-        results = KMeans(n_clusters=k).fit(voxels)
+def kmeans_voxel_reduce(voxels, savedir, subj_id, k=128):
+    # voxels = np.load(os.path.join(nsd_dir, f'subj_{subj_id}_train_voxels.npy'))
+    voxels = np.transpose(voxels)  #  we want voxels to be our samples in "NSD activation space" to find redundancies.
+    results = KMeans(n_clusters=k, random_state=0).fit(voxels)
 
-        all_min_idx = []
-        for c in range(k):
-            centroid = results.cluster_centers_[c]
-            min_dist = 1e16
-            min_idx = voxels.shape[0]
-            for idx in np.nonzero(results.labels_ == c)[0]:
-                dist = np.sum((voxels[idx] - centroid)**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    min_idx = idx
+    all_min_idx = []
+    for c in range(k):
+        cluster_idx = np.nonzero(results.labels_ == c)[0]
+        centroid = results.cluster_centers_[c]
+        centroid = np.broadcast_to(centroid[None, :], (cluster_idx.shape[0], centroid.shape[0]))
+        min_idx = cluster_idx[np.argmin(np.sum((voxels[cluster_idx] - centroid)**2, axis=-1))]
+        all_min_idx.append(min_idx)
 
-            all_min_idx.append(min_idx)
-
-        all_subj_idx.append(all_min_idx)
-
-    np.save(os.path.join(savedir, f'all_subj_{k}means_voxel_idx.npy'), np.array(all_subj_idx))
+    # np.save(os.path.join(savedir, f'subj{subj_id}_{k}means_voxel_idx.npy'), np.array(all_min_idx))
+    return np.array(all_min_idx)
     
 
 if __name__ == "__main__":
@@ -113,5 +105,12 @@ if __name__ == "__main__":
     parser.add_argument('--subj_id', type=int)
     args = parser.parse_args()
 
-    kmeans_voxel_reduce(args.nsd_path, args.savedir)
-    # extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
+    subj_voxels = extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
+    print(subj_voxels.shape)
+
+    filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id)
+    if filtered_idx is not None:
+        subj_voxels = subj_voxels[:, filtered_idx]
+
+    print(subj_voxels.shape)
+    np.save(os.path.join(args.savedir, f'subj_{args.subj_id}_{"" if filtered_idx is None else "kmeans_filtered_"}train_voxels.npy'), subj_voxels)
