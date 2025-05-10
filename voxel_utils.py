@@ -5,6 +5,7 @@ import numpy as np
 import pickle
 from PIL import Image
 from torchvision import transforms, utils
+from sklearn.cluster import KMeans
 
 
 def get_coco_imgs(coco_dir, coco_ids):
@@ -76,6 +77,34 @@ def extract_train_for_subj(split_ids_path, nsd_path, savedir, subj_id):
     np.save(os.path.join(savedir, f'subj_{subj_id}_train_voxels.npy'), subj_voxels)
 
 
+#   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
+#   Set k to the desired number of voxels to be extracted.  After kmeans is complete, each centroid is a tuning curve, so take corrs
+#   of all voxel tuning curves with that to obtain the best voxel match for that centroid. 
+def kmeans_voxel_reduce(nsd_dir, savedir, k=128, num_subjects=8):
+    all_subj_idx = []
+    for i in range(num_subjects):
+        voxels = np.load(os.path.join(nsd_dir, f'subj{i+1}.npy'))
+        voxels = np.transpose(voxels)  #  very important as we want voxels to be our samples in "NSD activation space" to find redundancies.
+        results = KMeans(n_clusters=k).fit(voxels)
+
+        all_min_idx = []
+        for c in range(k):
+            centroid = results.cluster_centers_[c]
+            min_dist = 1e16
+            min_idx = voxels.shape[0]
+            for idx in np.nonzero(results.labels_ == c)[0]:
+                dist = np.sum((voxels[idx] - centroid)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    min_idx = idx
+
+            all_min_idx.append(min_idx)
+
+        all_subj_idx.append(all_min_idx)
+
+    np.save(os.path.join(savedir, f'all_subj_{k}means_voxel_idx.npy'), np.array(all_subj_idx))
+    
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--splits_path', type=str)
@@ -84,4 +113,5 @@ if __name__ == "__main__":
     parser.add_argument('--subj_id', type=int)
     args = parser.parse_args()
 
-    extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
+    kmeans_voxel_reduce(args.nsd_path, args.savedir)
+    # extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
