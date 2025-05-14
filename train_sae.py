@@ -43,7 +43,7 @@ if __name__ == "__main__":
     lr=0.0004
     adam_beta1=0.9
     adam_beta2=0.999
-    aux_alpha = 10
+    aux_alpha = 256
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -52,7 +52,7 @@ if __name__ == "__main__":
         num_dims,
         args.expansion,
         topk=args.topk if args.topk > 0 else None,
-        auxk=64,
+        auxk=32,
         dead_steps_threshold=4,
         device='cpu',
         enc_data=None
@@ -68,7 +68,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_kmeans_filtered' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_{num_dims}means_filtered' if args.topk > 0 else f'vanilla_{args.expansion}exp'
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
