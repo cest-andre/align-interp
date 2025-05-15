@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
-from voxel_utils import extract_shared_for_subj, save_top_cocos
+from voxel_utils import extract_shared_for_subj, save_top_cocos, voxel_to_sae
 from utils import sort_acts
 
 
@@ -41,7 +41,9 @@ if __name__ == "__main__":
     dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     sae_weights = torch.load(os.path.join(args.weights_dir, f'subj{args.subj_id}', f'{args.sae_name}.pth'))['W_dec'].to(device).T
-    all_sorted_idx = sort_acts(dataloader, device, args.save_count, sae_weights=sae_weights)
+    all_sae_acts = voxel_to_sae(dataloader, sae_weights)
+
+    all_sorted_idx = sort_acts(all_sae_acts, device, args.save_count)
 
     savedir = os.path.join(args.savedir, f'subj{args.subj_id}', 'sae_latents', args.sae_name)
     Path(savedir).mkdir(parents=True, exist_ok=True)

@@ -63,6 +63,18 @@ def extract_train_for_subj(split_ids_path, nsd_path, savedir, subj_id):
     return subj_voxels
 
 
+def voxel_to_sae(dataloader, sae_weights):
+    all_sae_acts = []
+    for _, vox in enumerate(dataloader):
+        vox = vox[0].to(device)
+        count += vox.shape[0]
+
+        acts = vox @ sae_weights
+        all_sae_acts += acts.cpu().numpy().tolist()
+
+    return all_sae_acts
+
+
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
 #   Set k to the desired number of voxels to be extracted.  After kmeans is complete, each centroid is a tuning curve, so take corrs
 #   of all voxel tuning curves with that to obtain the best voxel match for that centroid. 

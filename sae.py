@@ -170,7 +170,7 @@ class ModelWrapper(nn.Module):
             assert input_dims != None
             self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
 
-    def forward(self, x, relu=False):
+    def forward(self, x, relu=False, center=False):
         x = x.to(self.device)
         x = self.block_input(x)
 
@@ -181,13 +181,13 @@ class ModelWrapper(nn.Module):
         if relu:
             x = nn.ReLU(inplace=True)(x)
 
-        if self.use_sae:
+        # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
+        if center:
             center_coord = x.shape[-1] // 2
             x = x[:, :, center_coord, center_coord]
 
-            # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
-
-            x = self.map(x)
-            x = x[:, :, None, None]
+            if self.use_sae:
+                x = self.map(x)
+                x = x[:, :, None, None]
 
         return x
