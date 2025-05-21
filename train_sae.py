@@ -4,8 +4,9 @@ import numpy as np
 import torch
 from torch import optim
 from torch.utils.data import TensorDataset, DataLoader
+from sklearn.cluster import KMeans
 
-from sae import SAE
+from sae import SAE, LN
 
 
 if __name__ == "__main__":
@@ -19,6 +20,7 @@ if __name__ == "__main__":
     parser.add_argument('--expansion', type=int, default=32)
     parser.add_argument('--topk', type=int, default=32)
     parser.add_argument('--num_input_dims', type=int, default=0)
+    parser.add_argument('--archetype_k', type=int, default=0)  # value used in paper = 32000
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
     assert args.start_epoch < args.epochs
@@ -27,9 +29,11 @@ if __name__ == "__main__":
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 
     acts_data = np.load(args.acts_path)
-    acts_data = torch.tensor(acts_data)
+    acts_data = torch.tensor(acts_data, dtype=torch.float)
     if args.relu:
         acts_data = torch.clamp(acts_data, min=0)
+
+    acts_data, _, _ = LN(acts_data)
 
     num_dims = args.num_input_dims
     if num_dims > 0 and num_dims < acts_data.shape[1]:
@@ -37,13 +41,22 @@ if __name__ == "__main__":
     else:
         num_dims = acts_data.shape[1]
 
+    archetypes = None
+    if args.archetype_k > 0:
+        # archetypes = KMeans(n_clusters=args.archetype_k, random_state=0).fit(acts_data.numpy()).cluster_centers_
+        # np.save(f'/home/alongon/model_weights/dnn_saes/resnet18/layer4.1.bn2/archetype_{args.archetype_k}means_results.npy', archetypes)
+        # archetypes = torch.tensor(archetypes)
+
+        archetypes = torch.tensor(np.load(f'/home/alongon/model_weights/dnn_saes/resnet50/layer4.1.bn2/archetype_{args.archetype_k}means_results.npy'))
+        # print(torch.nonzero(archetypes.norm(dim=-1)).shape)
+
     acts_ds = TensorDataset(acts_data)
     dataloader = DataLoader(acts_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-    lr=0.0004
-    adam_beta1=0.9
-    adam_beta2=0.999
-    aux_alpha = 256
+    lr = 0.0004
+    adam_beta1 = 0.9
+    adam_beta2 = 0.999
+    aux_alpha = 10
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -52,10 +65,11 @@ if __name__ == "__main__":
         num_dims,
         args.expansion,
         topk=args.topk if args.topk > 0 else None,
-        auxk=32,
-        dead_steps_threshold=4,
+        auxk=256,
+        dead_steps_threshold=64,
         device='cpu',
-        enc_data=None
+        enc_data=None,
+        archetypes=archetypes
     ).to(device)
 
     optimizer = optim.Adam(
@@ -68,7 +82,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_{num_dims}means_filtered' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_archetype' if args.topk > 0 else f'vanilla_{args.expansion}exp'
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
@@ -87,7 +101,7 @@ if __name__ == "__main__":
             latents, acts_hat, dead_acts_recon, num_dead = sae(acts)
 
             mse_loss = mse_scale * mse(acts_hat, acts, reduction="none").sum(-1)
-            weighted_latents = latents * sae.W_dec.norm(dim=1)
+            weighted_latents = latents# * sae.W_dec.norm(dim=1)
             sparsity = weighted_latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
@@ -110,12 +124,10 @@ if __name__ == "__main__":
 
         print(f"Average mse:  {total_mse / i}")
         all_mses.append(total_mse / i)
-
         print(f"Average L1:  {total_l1 / i}")
-
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 250 == 0:
+        if (ep+1) % 50 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
             torch.save(optimizer.state_dict(), f"{args.ckpt_dir}/{label}_opt_states_{ep+1}ep.pth")
         

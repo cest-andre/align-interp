@@ -8,7 +8,7 @@ import torchvision
 from torchvision import models, transforms
 # from thingsvision import get_extractor
 
-from sae import ModelWrapper
+from sae import ModelWrapper, LN
 from utils import sort_acts, save_top_imgs
 
 
@@ -58,7 +58,7 @@ def get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=False, sae_
 
         if return_imgs:
             for input in inputs:
-                all_imgs.append(input)
+                all_imgs.append(input.cpu())
 
         inputs = norm_transform(inputs.to(device))
         acts = model(inputs, relu=True, center=True)
@@ -66,7 +66,8 @@ def get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=False, sae_
         # acts = get_activations(extractor, inputs, layer_name, None, None, use_center=True)
 
         if sae_weights is not None:
-            acts = acts.to(torch.float64) @ sae_weights
+            acts, _, _ = LN(acts)
+            acts = acts @ sae_weights
 
         all_acts += acts.detach().cpu().numpy().tolist()
         
@@ -76,17 +77,15 @@ def get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=False, sae_
     return all_acts, all_imgs
 
 
-def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size, sae_weights=None):
-    all_acts, all_imgs = get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=True, batch_size=batch_size)
+def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size, sae_weights=None, sae_name=None):
+    all_acts, all_imgs = get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=True, sae_weights=sae_weights, batch_size=batch_size)
 
     if save_act_dir is not None:
-        np.save(os.path.join(save_act_dir, f'{layer_name}.npy'), np.array(all_acts))
-    
-    all_acts = torch.tensor(all_acts, dtype=torch.float64)
-    dataloader = DataLoader(TensorDataset(all_acts), batch_size=batch_size, shuffle=False, drop_last=False)
+        Path(save_act_dir).mkdir(parents=True, exist_ok=True)
+        np.save(os.path.join(save_act_dir, f'{layer_name if sae_name is None else sae_name}_valid.npy'), np.array(all_acts))
 
-    save_count = 256
-    all_sorted_idx = sort_acts(dataloader, device, save_count, sae_weights=sae_weights)
+    save_count = 32
+    all_sorted_idx = sort_acts(all_acts, save_count)
     for i in range(len(all_sorted_idx)):
         sorted_idx = all_sorted_idx[i]
         save_top_imgs(all_imgs[sorted_idx[:9]], save_img_dir, i)
@@ -128,7 +127,19 @@ if __name__ == '__main__':
     save_img_dir = None
     save_act_dir = args.save_act_dir
     if args.sae_name is not None:
-        sae_weights = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))['W_dec'].to(device).T
+        sae_states = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))
+        W = torch.relu(sae_states['W'])
+        # W /= (W.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # # enforce the norm constraint on Lambda to limit deviation from conv(C)
+        # norm_Lambda = sae_states['Relax'].norm(dim=-1, keepdim=True)  # norm per row
+        # scaling_factor = torch.clamp(1 / norm_Lambda, max=1)  # safe scaling factor
+        # sae_states['Relax'] *= scaling_factor  # scale Lambda to satisfy ||Lambda|| < delta
+
+        sae_weights = W @ sae_states['C'] + sae_states['Relax']
+        sae_weights = sae_weights.to(device).T
+
+        # sae_weights = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))['W_dec'].to(device).T
 
         #   TODO: init random vector with same mean and var as example sae_weights.  replace weights with this to get imnet valid
         #         acts to random dirs in activation space.
@@ -138,19 +149,20 @@ if __name__ == '__main__':
     else:
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    all_acts, _ = get_imnet_acts(model, args.imnet_dir, args.layer_name, device, sae_weights=sae_weights, batch_size=args.batch_size)
-    Path(save_act_dir).mkdir(parents=True, exist_ok=True)
-    #   TODO:  do not save sae_name if it doesn't exist -_-
-    np.save(os.path.join(save_act_dir, f'{args.sae_name}_valid.npy'), np.array(all_acts))
+    # all_acts, _ = get_imnet_acts(model, args.imnet_dir, args.layer_name, device, sae_weights=sae_weights, batch_size=args.batch_size)
+    # Path(save_act_dir).mkdir(parents=True, exist_ok=True)
+    # # #   TODO:  do not save sae_name if it doesn't exist -_-
+    # np.save(os.path.join(save_act_dir, f'{args.sae_name}_valid.npy'), np.array(all_acts))
 
-    # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
-    # save_top_act_imgs(
-    #     model,
-    #     args.imnet_dir,
-    #     args.layer_name,
-    #     args.save_act_dir,
-    #     save_img_dir,
-    #     device,
-    #     args.batch_size,
-    #     sae_weights=sae_weights
-    # )
+    Path(save_img_dir).mkdir(parents=True, exist_ok=True)
+    save_top_act_imgs(
+        model,
+        args.imnet_dir,
+        args.layer_name,
+        save_act_dir,
+        save_img_dir,
+        device,
+        args.batch_size,
+        sae_weights=sae_weights,
+        sae_name=args.sae_name
+    )

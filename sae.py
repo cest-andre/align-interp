@@ -12,8 +12,9 @@ def LN(x: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor, 
     return x, mu, std
 
 
+#   Archetypal code source:  https://github.com/KempnerInstitute/overcomplete/blob/main/overcomplete/sae/archetypal_dictionary.py
 class SAE(nn.Module):
-    def __init__(self, input_dims, expansion=32, dtype=torch.float64, device="cuda", topk=None, auxk=None, dead_steps_threshold=None, enc_data=None):
+    def __init__(self, input_dims, expansion=32, dtype=torch.float, device="cuda", topk=None, auxk=None, dead_steps_threshold=None, enc_data=None, archetypes=None):
         super().__init__()
 
         self.input_dims = input_dims
@@ -22,8 +23,7 @@ class SAE(nn.Module):
         self.dtype = dtype
         self.device = device
         self.topk = topk
-
-        self.init_weights(enc_data=enc_data)
+        self.archetypes = archetypes
 
         self.auxk = auxk
         self.dead_steps_threshold = dead_steps_threshold
@@ -36,14 +36,32 @@ class SAE(nn.Module):
         self.auxk_mask_fn = auxk_mask_fn
         self.register_buffer("stats_last_nonzero", torch.zeros(self.num_latents, dtype=torch.long))
 
-    def init_weights(self, enc_data=None):
-        self.W_dec = nn.Parameter(
-            torch.nn.init.kaiming_uniform_(
-                torch.empty(
-                    self.num_latents, self.output_dims, dtype=self.dtype, device=self.device
+        use_archetype = self.archetypes is not None
+        self.decode = self.archetype_decode if use_archetype else self.vanilla_decode
+        self.init_weights(use_archetype=use_archetype, enc_data=enc_data)
+
+        self.enc_bn = nn.BatchNorm1d(self.num_latents)
+
+    def init_weights(self, use_archetype, enc_data=None):
+        if use_archetype:
+            #   NOTE: should I pass archetypes through LN?  I believe paper mentioned doing something to this effect.
+            #   If I still have trouble with getting good results here, perhaps I can lower archetype_k  to be proportional
+            #   to the smaller dataset I use (or just take rand subset from this already extracted list?).
+            # self.archetypes, _, _ = LN(self.archetypes)
+            self.register_buffer("C", self.archetypes)
+            self.W = nn.Parameter(torch.eye(self.num_latents, self.archetypes.shape[0], dtype=self.dtype, device=self.device))
+            self.Relax = nn.Parameter(torch.zeros(self.num_latents, self.input_dims, dtype=self.dtype, device=self.device))
+            self.delta = 10# / self.num_latents
+
+            self._fused_dictionary = None
+        else:
+            self.W_dec = nn.Parameter(
+                torch.nn.init.kaiming_uniform_(
+                    torch.empty(
+                        self.num_latents, self.output_dims, dtype=self.dtype, device=self.device
+                    )
                 )
             )
-        )
 
         self.b_dec = nn.Parameter(
             torch.zeros(self.output_dims, dtype=self.dtype, device=self.device)
@@ -53,8 +71,9 @@ class SAE(nn.Module):
         #   Subset would be taken in training code.  If dataset is too small, the entire set should be passed,
         #   and it will be duplicated to match the number of sae latents.
         if enc_data is not None:
-            kaiming_bound = torch.max(self.W_dec)
-            enc_data, _, _ = LN(enc_data)
+            # kaiming_bound = torch.max(self.W_dec)
+            kaiming_bound = 0.1083
+            # enc_data, _, _ = LN(enc_data)
 
             data_min = torch.min(enc_data, dim=1).values
             data_min = data_min[:, None].broadcast_to(enc_data.shape)
@@ -84,6 +103,7 @@ class SAE(nn.Module):
 
     def encode(self, x):
         preact_feats = x @ self.W_enc + self.b_enc
+        preact_feats = self.enc_bn(preact_feats)
         top_dead_acts = None
         num_dead = torch.tensor(0)
 
@@ -110,14 +130,43 @@ class SAE(nn.Module):
 
         return nn.ReLU()(x), top_dead_acts, num_dead
 
-    def decode(self, x, mu, std):
+    def vanilla_decode(self, x, mu, std):
         x = x @ self.W_dec + self.b_dec
-        x = x * std + mu
+        # x = x * std + mu
         return x
+
+    def archetype_decode(self, x, mu, std):
+        dictionary = self.get_dict()
+        x = x @ dictionary + self.b_dec
+        # x = x * std + mu
+        return x
+
+    def get_dict(self):
+        if self.training:
+            # we are in .train() mode, compute the dictionary on the fly
+            with torch.no_grad():
+                # ensure W remains row-stochastic (positive and row sum to one)
+                W = torch.relu(self.W)
+                W /= (W.sum(dim=-1, keepdim=True) + 1e-8)
+                self.W.data = W
+
+                # enforce the norm constraint on Lambda to limit deviation from conv(C)
+                norm_Lambda = self.Relax.norm(dim=-1, keepdim=True)  # norm per row
+                scaling_factor = torch.clamp(self.delta / norm_Lambda, max=1)  # safe scaling factor
+                self.Relax.data *= scaling_factor  # scale Lambda to satisfy ||Lambda|| < delta
+
+            # compute the dictionary as a convex combination plus relaxation
+            D = self.W @ self.C + self.Relax
+            return D# * torch.exp(self.multiplier)
+        else:
+            # we are in .eval() mode, return the fused dictionary
+            assert self._fused_dictionary is not None, "Dictionary is not initialized."
+            return self._fused_dictionary
 
     def forward(self, x):
         dead_acts_recon = None
-        x, mu, std = LN(x)
+        # x, mu, std = LN(x)
+        mu = std = None
 
         latents, top_dead_acts, num_dead = self.encode(x)
         out = self.decode(latents, mu, std)
@@ -126,6 +175,21 @@ class SAE(nn.Module):
             dead_acts_recon = self.decode(top_dead_acts, mu, std)
 
         return latents, out, dead_acts_recon, num_dead
+
+    def train(self, mode=True):
+        """
+        Hook called when switching between training and evaluation mode.
+        We use it to fuse W, C, Relax and multiplier into a single dictionary.
+
+        Parameters
+        ----------
+        mode : bool, optional
+            Whether to set the model to training mode or not, by default True.
+        """
+        if not mode:
+            # we are in .eval() mode, fuse the dictionary
+            self._fused_dictionary = self.get_dictionary()
+        super().train(mode)
 
 
 #   Wrapper so that we have control over the forward pass.

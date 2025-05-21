@@ -48,6 +48,11 @@ def pairwise_corr(x, y):
     #   TODO: filter dead neurons???  no nonzeros after relu
     x = torch.clamp(x, min=0)
     y = torch.clamp(y, min=0)
+
+    #   Measure sparseness (percent 0) to see if that's what's driving higher corr with SAE latents.
+    print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
+    print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
+
     x_cent = x - torch.mean(x, 0)
     x_ss = torch.sum(torch.pow(x_cent, 2), 0)
 
