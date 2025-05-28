@@ -9,7 +9,7 @@ from torchvision import models, transforms
 # from thingsvision import get_extractor
 
 from sae import ModelWrapper, LN
-from utils import sort_acts, save_top_imgs
+from utils import sort_acts, save_top_imgs, get_coco_imgs
 
 
 def get_activations(extractor, x, module_name, neuron_coord=None, channel_id=None, use_center=False):
@@ -36,9 +36,9 @@ def get_activations(extractor, x, module_name, neuron_coord=None, channel_id=Non
     return activations
 
 
-def get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=False, sae_weights=None, batch_size=2048):
+def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weights=None, batch_size=2048):
     IMAGE_SIZE = 224
-    # specify ImageNet mean and standard deviation
+    # specify ImageNet mean and standard deviation (use for all image datasets such as coco?)
     MEAN = [0.485, 0.456, 0.406]
     STD = [0.229, 0.224, 0.225]
     norm_transform = transforms.Normalize(mean=MEAN, std=STD)
@@ -48,26 +48,32 @@ def get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=False, sae_
             transforms.ToTensor(),
     ])
 
-    imagenet_data = torchvision.datasets.ImageFolder(imnet_dir, transform=load_transform)
-    trainloader = DataLoader(imagenet_data, num_workers=8, batch_size=batch_size, shuffle=False, drop_last=False)
+    img_ds = None
+    if 'ILSVRC2012' in img_dir:  #  is imagenet
+        img_ds = torchvision.datasets.ImageFolder(img_dir, transform=load_transform)
+    else:  #  is coco
+        imgs = get_coco_imgs(img_dir, None, transform=load_transform)
+        img_ds = TensorDataset(torch.stack(imgs))
 
+    dataloader = DataLoader(img_ds, num_workers=1, batch_size=batch_size, shuffle=False, drop_last=False)
     all_acts = []
     all_imgs = []
-    for i, data in enumerate(trainloader, 0):
-        inputs, _ = data
+    for i, data in enumerate(dataloader, 0):
+        # inputs, _ = data
+        inputs = data[0]
 
         if return_imgs:
             for input in inputs:
                 all_imgs.append(input.cpu())
 
         inputs = norm_transform(inputs.to(device))
-        acts = model(inputs, relu=True, center=True)
+        acts = model(inputs, relu=False, center=True)
 
         # acts = get_activations(extractor, inputs, layer_name, None, None, use_center=True)
 
         if sae_weights is not None:
             acts, _, _ = LN(acts)
-            acts = acts @ sae_weights
+            acts = (acts.to(torch.float64) @ sae_weights['W_enc']) + sae_weights['b_enc']
 
         all_acts += acts.detach().cpu().numpy().tolist()
         
@@ -93,7 +99,7 @@ def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--imnet_dir', type=str)
+    parser.add_argument('--img_dir', type=str)
     parser.add_argument('--save_img_dir', type=str, default='')
     parser.add_argument('--save_act_dir', type=str, default='')
     parser.add_argument('--layer_name', type=str)
@@ -128,16 +134,11 @@ if __name__ == '__main__':
     save_act_dir = args.save_act_dir
     if args.sae_name is not None:
         sae_states = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))
-        W = torch.relu(sae_states['W'])
-        # W /= (W.sum(dim=-1, keepdim=True) + 1e-8)
+        sae_states['W_enc'] = sae_states['W_enc'].to(device)
+        sae_states['b_enc'] = sae_states['b_enc'].to(device)
 
-        # # enforce the norm constraint on Lambda to limit deviation from conv(C)
-        # norm_Lambda = sae_states['Relax'].norm(dim=-1, keepdim=True)  # norm per row
-        # scaling_factor = torch.clamp(1 / norm_Lambda, max=1)  # safe scaling factor
-        # sae_states['Relax'] *= scaling_factor  # scale Lambda to satisfy ||Lambda|| < delta
-
-        sae_weights = W @ sae_states['C'] + sae_states['Relax']
-        sae_weights = sae_weights.to(device).T
+        # sae_weights = sae_states['W'] @ sae_states['C'] + sae_states['Relax']
+        # sae_weights = sae_weights.to(device).T
 
         # sae_weights = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))['W_dec'].to(device).T
 
@@ -149,20 +150,19 @@ if __name__ == '__main__':
     else:
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    # all_acts, _ = get_imnet_acts(model, args.imnet_dir, args.layer_name, device, sae_weights=sae_weights, batch_size=args.batch_size)
-    # Path(save_act_dir).mkdir(parents=True, exist_ok=True)
-    # # #   TODO:  do not save sae_name if it doesn't exist -_-
-    # np.save(os.path.join(save_act_dir, f'{args.sae_name}_valid.npy'), np.array(all_acts))
+    all_acts, _ = get_img_acts(model, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
+    Path(save_act_dir).mkdir(parents=True, exist_ok=True)
+    np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
 
-    Path(save_img_dir).mkdir(parents=True, exist_ok=True)
-    save_top_act_imgs(
-        model,
-        args.imnet_dir,
-        args.layer_name,
-        save_act_dir,
-        save_img_dir,
-        device,
-        args.batch_size,
-        sae_weights=sae_weights,
-        sae_name=args.sae_name
-    )
+    # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
+    # save_top_act_imgs(
+    #     model,
+    #     args.img_dir,
+    #     args.layer_name,
+    #     save_act_dir,
+    #     save_img_dir,
+    #     device,
+    #     args.batch_size,
+    #     sae_weights=sae_weights,
+    #     sae_name=args.sae_name
+    # )

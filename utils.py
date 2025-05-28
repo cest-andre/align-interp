@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
+from PIL import Image
 import numpy as np
 import torch
 from torchvision import transforms, utils
+from sklearn.metrics import jaccard_score
 
 
 def sort_acts(all_acts, save_count):
@@ -43,6 +45,32 @@ def save_top_imgs(top_imgs, savedir, unit_id, bot_imgs=None):
         grid.save(os.path.join(bot_grids_path, f"{unit_id}.png"))
 
 
+def get_coco_imgs(coco_dir, coco_ids, transform=None):
+    if coco_ids is None:
+        coco_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
+    imgs = []
+    for id in coco_ids:
+        img = Image.open(os.path.join(coco_dir, f'{id}.jpg'))
+        if transform is not None:
+            img = transform(img)
+        imgs.append(img)
+
+    return imgs
+
+
+def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, bot_ids=None):
+    to_tensor = transforms.ToTensor()
+    top_imgs = get_coco_imgs(coco_dir, coco_ids)
+    top_imgs = [to_tensor(img) for img in top_imgs]
+
+    bot_imgs = None
+    if bot_ids is not None:
+        bot_imgs = get_coco_imgs(coco_dir, bot_ids)
+        bot_imgs = [to_tensor(img) for img in bot_imgs]
+
+    save_top_imgs(top_imgs, savedir, unit_id, bot_imgs)
+
+
 #   x and y are torch tensors with shape: (num_data, num_units).  Pairwise corrs obtained between all units.
 def pairwise_corr(x, y):
     #   TODO: filter dead neurons???  no nonzeros after relu
@@ -63,3 +91,20 @@ def pairwise_corr(x, y):
     corrs = torch.clamp(corrs, min=-1, max=1)
 
     return corrs
+
+
+def pairwise_jaccard(x, y):
+    x = torch.clamp(x, min=0, max=None).T
+    y = torch.clamp(y, min=0, max=None).T
+
+    scores = []
+    for i in range(y.shape[0]):
+        top_score = 0
+        for j in range(x.shape[0]):
+            score = (torch.logical_and(y[i], x[j]).sum(dim=-1) / torch.logical_or(y[i], x[j]).sum(dim=-1)).cpu().numpy()
+            if score > top_score:
+                top_score = score
+
+        scores.append(top_score)
+
+    return np.mean(np.array(scores))

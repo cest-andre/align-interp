@@ -3,32 +3,10 @@ import argparse
 from pathlib import Path
 import numpy as np
 import pickle
-from PIL import Image
 from torchvision import transforms, utils
 from sklearn.cluster import KMeans
 
 from utils import save_top_imgs
-
-
-def get_coco_imgs(coco_dir, coco_ids):
-    imgs = []
-    for id in coco_ids:
-        imgs.append(Image.open(os.path.join(coco_dir, f'{id}.jpg')))
-
-    return imgs
-
-
-def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, bot_ids=None):
-    to_tensor = transforms.ToTensor()
-    top_imgs = get_coco_imgs(coco_dir, coco_ids)
-    top_imgs = [to_tensor(img) for img in top_imgs]
-
-    bot_imgs = None
-    if bot_ids is not None:
-        bot_imgs = get_coco_imgs(coco_dir, bot_ids)
-        bot_imgs = [to_tensor(img) for img in bot_imgs]
-
-    save_top_imgs(top_imgs, savedir, unit_id, bot_imgs)
 
 
 def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
@@ -75,6 +53,39 @@ def voxel_to_sae(dataloader, sae_weights):
     return all_sae_acts
 
 
+def viz_voxels():
+    pass
+    # coco_ids, voxel_data = extract_shared_for_subj(args.splits_path, args.nsd_path, args.subj_id)
+    # voxel_data = torch.tensor(voxel_data)
+    # if args.filter_path is not None:
+    #     voxel_data = voxel_data[:, np.load(args.filter_path)]
+        
+    # if args.num_voxels > 0 and args.num_voxels < voxel_data.shape[1]:
+    #     voxel_data = voxel_data[:, torch.randperm(voxel_data.shape[1])[:args.num_voxels]]
+
+    # voxel_ds = TensorDataset(voxel_data)
+    # dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
+    # sae_weights = torch.load(os.path.join(args.weights_dir, f'subj{args.subj_id}', f'{args.sae_name}.pth'))['W_dec'].to(device).T
+    # all_sae_acts = voxel_to_sae(dataloader, sae_weights)
+
+    # all_sorted_idx = sort_acts(all_sae_acts, device, args.save_count)
+
+    # savedir = os.path.join(args.savedir, f'subj{args.subj_id}', 'sae_latents', args.sae_name)
+    # Path(savedir).mkdir(parents=True, exist_ok=True)
+
+    # for i in range(len(all_sorted_idx)):
+    #     sorted_idx = all_sorted_idx[i]
+    #     save_top_cocos(args.coco_dir, coco_ids[sorted_idx[:9]], i, savedir)
+
+
+def voxel_dnn_align(subj_id):
+    pass  #  TODO: load dnn acts for coco set, then extract subset for subj.
+    #  subj_ids, _ = extract_shared_for_subj(...)
+    #  coco_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
+    #  coco_ids.index(subj_ids[i])  # gives us index of image wrt all of coco to then extract from our dnn coco acts list.
+
+
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
 #   Set k to the desired number of voxels to be extracted.  After kmeans is complete, each centroid is a tuning curve, so take corrs
 #   of all voxel tuning curves with that to obtain the best voxel match for that centroid. 
@@ -98,18 +109,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--splits_path', type=str)
     parser.add_argument('--nsd_path', type=str)
+    parser.add_argument('--coco_dir', type=str)
     parser.add_argument('--savedir', type=str)
     parser.add_argument('--subj_id', type=int)
-    parser.add_argument('--k', type=int, default=0)
+    parser.add_argument('--sae_name', type=str)
+    parser.add_argument('--weights_dir', type=str)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--save_count', type=int, default=32)
+    parser.add_argument('--filter_path', type=str, default=None)
+    parser.add_argument('--device', type=int)
+    parser.add_argument('--reduce_k', type=int, default=0)
     args = parser.parse_args()
 
     subj_voxels = extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
 
     file_name = f'subj_{args.subj_id}_'
-    if args.k > 0:
-        filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id, k=args.k)
+    if args.reduce_k > 0:
+        filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id, k=args.reduce_k)
         subj_voxels = subj_voxels[:, filtered_idx]
-        file_name += f'{args.k}means_filtered_'
+        file_name += f'{args.reduce_k}means_filtered_'
 
     file_name += 'train_voxels.npy'
     print(subj_voxels.shape)
