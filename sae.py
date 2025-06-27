@@ -34,7 +34,7 @@ class SAE(nn.Module):
             return x
 
         self.auxk_mask_fn = auxk_mask_fn
-        self.register_buffer("stats_last_nonzero", torch.zeros(self.num_latents, dtype=torch.long))
+        self.register_buffer("stats_last_nonzero", torch.zeros(self.num_latents, dtype=torch.long, device=self.device))
 
         use_archetype = self.archetypes is not None
         self.decode = self.archetype_decode if use_archetype else self.vanilla_decode
@@ -51,7 +51,7 @@ class SAE(nn.Module):
             self.register_buffer("C", self.archetypes)
             self.W = nn.Parameter(torch.eye(self.num_latents, self.archetypes.shape[0], dtype=self.dtype, device=self.device))
             self.Relax = nn.Parameter(torch.zeros(self.num_latents, self.input_dims, dtype=self.dtype, device=self.device))
-            self.delta = 10# / self.num_latents
+            self.delta = 1# / self.num_latents
 
             self._fused_dictionary = None
         else:
@@ -110,25 +110,27 @@ class SAE(nn.Module):
         if self.topk is not None:
             topk_res = torch.topk(preact_feats, k=self.topk, dim=-1)
             values = nn.ReLU()(topk_res.values)
-            x = torch.zeros_like(preact_feats)
+            x = torch.zeros_like(preact_feats, device=self.device)
             x.scatter_(-1, topk_res.indices, values)
 
-            self.stats_last_nonzero *= (x == 0).all(dim=0).long()
-            self.stats_last_nonzero += 1
+            # self.stats_last_nonzero *= (x == 0).all(dim=0).long()
+            # self.stats_last_nonzero += 1
 
-            auxk_acts = self.auxk_mask_fn(preact_feats)
-            #   TODO: ensure all batch entries have at least auxk nonzero (dead) acts.
-            #   On second thought, do I even need to check this?  As there are so many latents,
-            #   and only k can fire each batch, perhaps it's fairly likely that at least 512
-            #   do not fire for the first epoch.
-            if (torch.sum(auxk_acts != 0, dim=-1) >= self.auxk).all(dim=0):
-                num_dead = torch.mean(torch.sum(auxk_acts != 0, dim=-1).type(torch.float))
-                deadk_res = torch.topk(auxk_acts, k=self.auxk, dim=-1)
-                top_dead_acts = torch.zeros_like(auxk_acts)
-                top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
-                top_dead_acts = nn.ReLU()(top_dead_acts)
+            # auxk_acts = self.auxk_mask_fn(preact_feats)
+            # #   TODO: ensure all batch entries have at least auxk nonzero (dead) acts.
+            # #   On second thought, do I even need to check this?  As there are so many latents,
+            # #   and only k can fire each batch, perhaps it's fairly likely that at least 512
+            # #   do not fire for the first epoch.
+            # if (torch.sum(auxk_acts != 0, dim=-1) >= self.auxk).all(dim=0):
+            #     num_dead = torch.mean(torch.sum(auxk_acts != 0, dim=-1).type(torch.float))
+            #     deadk_res = torch.topk(auxk_acts, k=self.auxk, dim=-1)
+            #     top_dead_acts = torch.zeros_like(auxk_acts)
+            #     top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
+            #     top_dead_acts = nn.ReLU()(top_dead_acts)
+        else:
+            x = preact_feats
 
-        return nn.ReLU()(x), top_dead_acts, num_dead
+        return nn.ReLU()(x), preact_feats, num_dead
 
     def vanilla_decode(self, x, mu, std):
         x = x @ self.W_dec + self.b_dec
@@ -168,13 +170,13 @@ class SAE(nn.Module):
         # x, mu, std = LN(x)
         mu = std = None
 
-        latents, top_dead_acts, num_dead = self.encode(x)
+        latents, preact_feats, num_dead = self.encode(x)
         out = self.decode(latents, mu, std)
 
-        if top_dead_acts is not None:
-            dead_acts_recon = self.decode(top_dead_acts, mu, std)
+        # if top_dead_acts is not None:
+        #     dead_acts_recon = self.decode(top_dead_acts, mu, std)
 
-        return latents, out, dead_acts_recon, num_dead
+        return latents, out, preact_feats, num_dead
 
     def train(self, mode=True):
         """
@@ -188,7 +190,8 @@ class SAE(nn.Module):
         """
         if not mode:
             # we are in .eval() mode, fuse the dictionary
-            self._fused_dictionary = self.get_dictionary()
+            if self.archetypes is not None:
+                self._fused_dictionary = self.get_dict()
         super().train(mode)
 
 

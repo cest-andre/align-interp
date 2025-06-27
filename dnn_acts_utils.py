@@ -10,6 +10,7 @@ from torchvision import models, transforms
 
 from sae import ModelWrapper, LN
 from utils import sort_acts, save_top_imgs, get_coco_imgs
+from monkey_utils import get_mm_imgs
 
 
 def get_activations(extractor, x, module_name, neuron_coord=None, channel_id=None, use_center=False):
@@ -51,8 +52,11 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
     img_ds = None
     if 'ILSVRC2012' in img_dir:  #  is imagenet
         img_ds = torchvision.datasets.ImageFolder(img_dir, transform=load_transform)
-    else:  #  is coco
+    elif 'NSD_Preprocessed' in img_dir:  #  is coco
         imgs = get_coco_imgs(img_dir, None, transform=load_transform)
+        img_ds = TensorDataset(torch.stack(imgs))
+    elif 'ManyMonkeys' in img_dir:  #  is ManyMonkeys
+        imgs = get_mm_imgs(img_dir, transform=load_transform)
         img_ds = TensorDataset(torch.stack(imgs))
 
     dataloader = DataLoader(img_ds, num_workers=1, batch_size=batch_size, shuffle=False, drop_last=False)
@@ -67,13 +71,25 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
                 all_imgs.append(input.cpu())
 
         inputs = norm_transform(inputs.to(device))
-        acts = model(inputs, relu=False, center=True)
+        acts = model(inputs, relu=True, center=True)
 
         # acts = get_activations(extractor, inputs, layer_name, None, None, use_center=True)
 
         if sae_weights is not None:
             acts, _, _ = LN(acts)
-            acts = (acts.to(torch.float64) @ sae_weights['W_enc']) + sae_weights['b_enc']
+            acts = (acts @ sae_weights['W_enc']) + sae_weights['b_enc']
+            if 'bn' in sae_weights.keys():
+                acts = sae_weights['bn'](acts)
+
+            # acts = torch.nn.ReLU()(acts @ sae_weights['W_dec'].T)
+
+            #   topk activation SAE
+            topk_res = torch.topk(acts, k=256, dim=-1)
+            values = torch.nn.ReLU()(topk_res.values)
+            acts = torch.zeros_like(acts, device=acts.device)
+            acts.scatter_(-1, topk_res.indices, values)
+
+            acts = torch.nn.ReLU()(acts)
 
         all_acts += acts.detach().cpu().numpy().tolist()
         
@@ -127,15 +143,28 @@ if __name__ == '__main__':
 
     model = models.resnet50(weights='IMAGENET1K_V2').to(device)
     model = ModelWrapper(model, None, device)
-    model.eval()
 
-    sae_weights = None
+    sae_states = None
     save_img_dir = None
     save_act_dir = args.save_act_dir
     if args.sae_name is not None:
         sae_states = torch.load(os.path.join(args.sae_weights_dir, f'{args.sae_name}.pth'))
         sae_states['W_enc'] = sae_states['W_enc'].to(device)
         sae_states['b_enc'] = sae_states['b_enc'].to(device)
+
+        if 'archetype' in args.sae_name:
+            #   TODO: load encoder batch norm weights?  or maybe init a layer and load weights into it?
+            bn = torch.nn.BatchNorm1d(sae_states['W_enc'].shape[-1])
+            bn_states = {}
+            for state in sae_states.keys():
+                if 'enc_bn' in state:
+                    bn_states[state.replace('enc_bn.', '')] = sae_states[state]
+
+            bn.load_state_dict(bn_states)
+            bn.to(device)
+            sae_states['bn'] = bn
+
+        # sae_states['W_dec'] = sae_states['W_dec'].to(device)
 
         # sae_weights = sae_states['W'] @ sae_states['C'] + sae_states['Relax']
         # sae_weights = sae_weights.to(device).T
@@ -145,7 +174,7 @@ if __name__ == '__main__':
         #   TODO: init random vector with same mean and var as example sae_weights.  replace weights with this to get imnet valid
         #         acts to random dirs in activation space.
 
-        save_act_dir = os.path.join(args.save_act_dir, args.layer_name)
+        # save_act_dir = os.path.join(args.save_act_dir, args.layer_name)
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name, args.sae_name)
     else:
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name)

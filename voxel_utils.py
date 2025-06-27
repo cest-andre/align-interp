@@ -1,12 +1,18 @@
 import os
+import sys
 import argparse
 from pathlib import Path
 import numpy as np
+import torch
+from torch.utils.data import TensorDataset, DataLoader
 import pickle
 from torchvision import transforms, utils
 from sklearn.cluster import KMeans
 
-from utils import save_top_imgs
+sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
+from src.alignment.linear import Linear
+
+from utils import save_top_imgs, pairwise_corr, pairwise_jaccard
 
 
 def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
@@ -27,7 +33,7 @@ def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
     return coco_ids, subj_voxels
 
 
-def extract_train_for_subj(split_ids_path, nsd_path, savedir, subj_id):
+def extract_train_for_subj(split_ids_path, nsd_path, subj_id):
     train_ids = pickle.load(open(split_ids_path, 'rb'))['train']
     all_voxels = pickle.load(open(nsd_path, 'rb'))
 
@@ -41,13 +47,14 @@ def extract_train_for_subj(split_ids_path, nsd_path, savedir, subj_id):
     return subj_voxels
 
 
-def voxel_to_sae(dataloader, sae_weights):
+def voxel_to_sae(dataloader, sae_weights, device):
     all_sae_acts = []
     for _, vox in enumerate(dataloader):
         vox = vox[0].to(device)
-        count += vox.shape[0]
 
-        acts = vox @ sae_weights
+        # acts = vox @ sae_weights
+        acts = torch.nn.ReLU()((vox.to(torch.float) @ sae_weights['W_enc']) + sae_weights['b_enc'])
+
         all_sae_acts += acts.cpu().numpy().tolist()
 
     return all_sae_acts
@@ -79,11 +86,23 @@ def viz_voxels():
     #     save_top_cocos(args.coco_dir, coco_ids[sorted_idx[:9]], i, savedir)
 
 
-def voxel_dnn_align(subj_id):
-    pass  #  TODO: load dnn acts for coco set, then extract subset for subj.
-    #  subj_ids, _ = extract_shared_for_subj(...)
-    #  coco_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
-    #  coco_ids.index(subj_ids[i])  # gives us index of image wrt all of coco to then extract from our dnn coco acts list.
+def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj, dnn_acts, voxel_acts, device):
+    subj_coco_ids, _ = extract_shared_for_subj(splits_path, nsd_path, subj)
+    all_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
+    subj_coco_ids = [all_ids.index(str(id)) for id in subj_coco_ids]
+
+    dnn_acts = torch.tensor(dnn_acts[subj_coco_ids], device=device)
+    voxel_acts = torch.tensor(voxel_acts, device=device)
+
+    metric = Linear()
+    print(f"Linear scores: {metric.fit_kfold_score(x=dnn_acts, y=voxel_acts)}")
+    print(f"Ridge scores: {metric.fit_kfold_ridge(x=dnn_acts.cpu().to(torch.float), y=voxel_acts.cpu().to(torch.float))}\n")
+
+    # results = pairwise_corr(dnn_acts, voxel_acts)
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
+    # score = pairwise_jaccard(dnn_acts, voxel_acts)
+    # print(f'Jaccard pairwise: {score}')
 
 
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
@@ -110,6 +129,8 @@ if __name__ == "__main__":
     parser.add_argument('--splits_path', type=str)
     parser.add_argument('--nsd_path', type=str)
     parser.add_argument('--coco_dir', type=str)
+    parser.add_argument('--dnn_acts_path', type=str)
+    parser.add_argument('--voxel_acts_path', type=str)
     parser.add_argument('--savedir', type=str)
     parser.add_argument('--subj_id', type=int)
     parser.add_argument('--sae_name', type=str)
@@ -121,14 +142,36 @@ if __name__ == "__main__":
     parser.add_argument('--reduce_k', type=int, default=0)
     args = parser.parse_args()
 
-    subj_voxels = extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
+    # subj_voxels = extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
 
-    file_name = f'subj_{args.subj_id}_'
-    if args.reduce_k > 0:
-        filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id, k=args.reduce_k)
-        subj_voxels = subj_voxels[:, filtered_idx]
-        file_name += f'{args.reduce_k}means_filtered_'
+    # file_name = f'subj_{args.subj_id}_'
+    # if args.reduce_k > 0:
+    #     filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id, k=args.reduce_k)
+    #     subj_voxels = subj_voxels[:, filtered_idx]
+    #     file_name += f'{args.reduce_k}means_filtered_'
 
-    file_name += 'train_voxels.npy'
-    print(subj_voxels.shape)
-    np.save(os.path.join(args.savedir, file_name), subj_voxels)
+    # file_name += 'train_voxels.npy'
+    # print(subj_voxels.shape)
+    # np.save(os.path.join(args.savedir, file_name), subj_voxels)
+
+
+    # #   Extract voxel sae latent acts
+    # device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    # subj_voxels = np.load(args.voxel_acts_path)
+    # voxel_ds = TensorDataset(torch.tensor(subj_voxels))
+    # dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
+    # sae_weights = torch.load(os.path.join(args.weights_dir, f'subj{args.subj_id}', f'{args.sae_name}.pth'))
+    # sae_weights['W_enc'] = sae_weights['W_enc'].to(device)
+    # sae_weights['b_enc'] = sae_weights['b_enc'].to(device)
+
+    # sae_acts = voxel_to_sae(dataloader, sae_weights, device)
+    # np.save(os.path.join(args.savedir, f'subj{args.subj_id}', 'voxel_sae_acts', f'{args.sae_name}.npy'), np.array(sae_acts))
+
+
+    #   Load DNN coco acts, extract only images that are for subj.  Then load voxel acts (raw or sae) and run pairwise corrs.
+    device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    dnn_acts = np.load(args.dnn_acts_path)
+    voxel_acts = np.load(args.voxel_acts_path)
+
+    voxel_dnn_align(args.splits_path, args.nsd_path, args.coco_dir, args.subj_id, dnn_acts, voxel_acts, device)

@@ -44,11 +44,10 @@ if __name__ == "__main__":
     archetypes = None
     if args.archetype_k > 0:
         # archetypes = KMeans(n_clusters=args.archetype_k, random_state=0).fit(acts_data.numpy()).cluster_centers_
-        # np.save(f'/home/alongon/model_weights/dnn_saes/resnet18/layer4.1.bn2/archetype_{args.archetype_k}means_results.npy', archetypes)
+        # np.save(f'/home/alongon/model_weights/dnn_saes/resnet50/layer4.1.bn2/archetype_{args.archetype_k}means_results.npy', archetypes)
         # archetypes = torch.tensor(archetypes)
 
         archetypes = torch.tensor(np.load(f'/home/alongon/model_weights/dnn_saes/resnet50/layer4.1.bn2/archetype_{args.archetype_k}means_results.npy'))
-        # print(torch.nonzero(archetypes.norm(dim=-1)).shape)
 
     acts_ds = TensorDataset(acts_data)
     dataloader = DataLoader(acts_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
@@ -56,7 +55,8 @@ if __name__ == "__main__":
     lr = 0.0004
     adam_beta1 = 0.9
     adam_beta2 = 0.999
-    aux_alpha = 10
+    aux_alpha = 1
+    l1_lambda = 1e-8
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -67,7 +67,7 @@ if __name__ == "__main__":
         topk=args.topk if args.topk > 0 else None,
         auxk=256,
         dead_steps_threshold=64,
-        device='cpu',
+        device=device,
         enc_data=None,
         archetypes=archetypes
     ).to(device)
@@ -82,7 +82,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_{args.batch_size}batch_{aux_alpha}aux_{args.expansion}exp_archetype' if args.topk > 0 else f'vanilla_{args.expansion}exp'
+    label = f'top{args.topk}_{args.expansion}exp_archetype' if args.topk > 0 else f'vanilla_1e-8lambda_{args.expansion}exp'
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
@@ -98,27 +98,35 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             acts = acts[0].to(device)
-            latents, acts_hat, dead_acts_recon, num_dead = sae(acts)
+            latents, acts_hat, preact_feats, num_dead = sae(acts)
 
             mse_loss = mse_scale * mse(acts_hat, acts, reduction="none").sum(-1)
-            weighted_latents = latents# * sae.W_dec.norm(dim=1)
-            sparsity = weighted_latents.norm(p=1, dim=-1)
+            # weighted_latents = latents * sae.W_dec.norm(dim=1)
+            # sparsity = weighted_latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
-            total_l1 += sparsity.mean().cpu().detach().numpy()
+            # total_l1 += sparsity.mean().cpu().detach().numpy()
             total_dead += num_dead.cpu().numpy()
 
-            loss = mse_loss
+            loss = mse_loss.mean()
 
-            #  Auxiliary loss (prevents dead latents)
-            if dead_acts_recon is not None:
-                error = acts - acts_hat
-                aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1) / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
-                aux_loss = aux_alpha * aux_mse.nan_to_num(0)
+            #   REANIMATE LOSS!!!  Credit to Thomas Fel
+            is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
+            # we push the pre_codes (before relu) towards the positive orthant
+            reanim_loss = (preact_feats * is_dead[None, :]).mean()
 
-                loss += aux_loss
+            loss -= reanim_loss * 1e-3
 
-            loss = loss.mean()
+            # #  Auxiliary loss (prevents dead latents)
+            # if dead_acts_recon is not None:
+            #     error = acts - acts_hat
+            #     aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1) / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
+            #     aux_loss = aux_alpha * aux_mse.nan_to_num(0)
+
+            #     loss += aux_loss.mean()
+
+            # loss += l1_lambda * sparsity.mean()
+
             loss.backward()
             optimizer.step()
 

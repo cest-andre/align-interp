@@ -4,7 +4,8 @@ from PIL import Image
 import numpy as np
 import torch
 from torchvision import transforms, utils
-from sklearn.metrics import jaccard_score
+
+from sae import LN
 
 
 def sort_acts(all_acts, save_count):
@@ -80,6 +81,9 @@ def pairwise_corr(x, y):
     #   Measure sparseness (percent 0) to see if that's what's driving higher corr with SAE latents.
     print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
     print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
+
+    x, _, _ = LN(x)
+    y, _, _ = LN(y)
 
     x_cent = x - torch.mean(x, 0)
     x_ss = torch.sum(torch.pow(x_cent, 2), 0)
