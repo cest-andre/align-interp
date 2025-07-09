@@ -95,7 +95,7 @@ def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj, dnn_acts, voxel_acts,
     voxel_acts = torch.tensor(voxel_acts, device=device)
 
     metric = Linear()
-    print(f"Linear scores: {metric.fit_kfold_score(x=dnn_acts, y=voxel_acts)}")
+    # print(f"Linear scores: {metric.fit_kfold_score(x=dnn_acts, y=voxel_acts)}")
     print(f"Ridge scores: {metric.fit_kfold_ridge(x=dnn_acts.cpu().to(torch.float), y=voxel_acts.cpu().to(torch.float))}\n")
 
     # results = pairwise_corr(dnn_acts, voxel_acts)
@@ -172,6 +172,7 @@ if __name__ == "__main__":
     #   Load DNN coco acts, extract only images that are for subj.  Then load voxel acts (raw or sae) and run pairwise corrs.
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     dnn_acts = np.load(args.dnn_acts_path)
+    dnn_acts = np.clip(dnn_acts, a_min=0, a_max=None)
     voxel_acts = np.load(args.voxel_acts_path)
 
     voxel_dnn_align(args.splits_path, args.nsd_path, args.coco_dir, args.subj_id, dnn_acts, voxel_acts, device)

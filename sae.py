@@ -40,7 +40,7 @@ class SAE(nn.Module):
         self.decode = self.archetype_decode if use_archetype else self.vanilla_decode
         self.init_weights(use_archetype=use_archetype, enc_data=enc_data)
 
-        self.enc_bn = nn.BatchNorm1d(self.num_latents)
+        # self.enc_bn = nn.BatchNorm1d(self.num_latents)
 
     def init_weights(self, use_archetype, enc_data=None):
         if use_archetype:
@@ -103,7 +103,7 @@ class SAE(nn.Module):
 
     def encode(self, x):
         preact_feats = x @ self.W_enc + self.b_enc
-        preact_feats = self.enc_bn(preact_feats)
+        # preact_feats = self.enc_bn(preact_feats)
         top_dead_acts = None
         num_dead = torch.tensor(0)
 
@@ -195,66 +195,68 @@ class SAE(nn.Module):
         super().train(mode)
 
 
+#   TODO:  SCRAPPED UNTIL RESIDUAL STREAM HAS BEEN IMPLEMENTED (is it not already implemented within model.layerX modules?).
+#
 #   Wrapper so that we have control over the forward pass.
-class ModelWrapper(nn.Module):
-    target_neuron = None
-    all_acts = []
+# class ModelWrapper(nn.Module):
+#     target_neuron = None
+#     all_acts = []
 
-    def __init__(self, model, expansion, device, use_sae=False, input_dims=None):
-        super().__init__()
-        self.device = device
-        self.block_output = None
+#     def __init__(self, model, expansion, device, use_sae=False, input_dims=None):
+#         super().__init__()
+#         self.device = device
+#         self.block_output = None
 
-        self.block_input = nn.Sequential()
-        self.block_input.append(model.conv1)
-        self.block_input.append(model.bn1)
-        self.block_input.append(model.relu)
-        self.block_input.append(model.maxpool)
-        self.block_input.append(model.layer1)
-        self.block_input.append(model.layer2)
+#         self.block_input = nn.Sequential()
+#         self.block_input.append(model.conv1)
+#         self.block_input.append(model.bn1)
+#         self.block_input.append(model.relu)
+#         self.block_input.append(model.maxpool)
+#         self.block_input.append(model.layer1)
+#         self.block_input.append(model.layer2)
 
-        # self.block_input.append(model.layer3[:5])
-        # self.block_output = nn.Sequential()
-        # self.block_output.append(model.layer3[5].conv1)
-        # self.block_output.append(model.layer3[5].bn1)
-        # self.block_output.append(model.layer3[5].relu)
-        # self.block_output.append(model.layer3[5].conv2)
-        # self.block_output.append(model.layer3[5].bn2)
-        # self.block_output.append(model.layer3[5].relu)
-        # self.block_output.append(model.layer3[5].conv3)
-        # self.block_output.append(model.layer3[5].bn3)
+#         # self.block_input.append(model.layer3[:5])
+#         # self.block_output = nn.Sequential()
+#         # self.block_output.append(model.layer3[5].conv1)
+#         # self.block_output.append(model.layer3[5].bn1)
+#         # self.block_output.append(model.layer3[5].relu)
+#         # self.block_output.append(model.layer3[5].conv2)
+#         # self.block_output.append(model.layer3[5].bn2)
+#         # self.block_output.append(model.layer3[5].relu)
+#         # self.block_output.append(model.layer3[5].conv3)
+#         # self.block_output.append(model.layer3[5].bn3)
 
-        self.block_input.append(model.layer3)
-        self.block_input.append(model.layer4[0])
-        self.block_input.append(model.layer4[1].conv1)
-        self.block_input.append(model.layer4[1].bn1)
-        self.block_input.append(model.layer4[1].relu)
-        self.block_input.append(model.layer4[1].conv2)
-        self.block_input.append(model.layer4[1].bn2)
+#         self.block_input.append(model.layer3)
+#         self.block_input.append(model.layer4[0])
+#         self.block_input.append(model.layer4[1].conv1)
+#         self.block_input.append(model.layer4[1].bn1)
+#         self.block_input.append(model.layer4[1].relu)
+#         self.block_input.append(model.layer4[1].conv2)
+#         self.block_input.append(model.layer4[1].bn2)
 
-        self.use_sae = use_sae
-        if self.use_sae:
-            assert input_dims != None
-            self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
+#         self.use_sae = use_sae
+#         if self.use_sae:
+#             assert input_dims != None
+#             self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
 
-    def forward(self, x, relu=False, center=False):
-        x = x.to(self.device)
-        x = self.block_input(x)
+#     def forward(self, x, relu=False, center=False):
+#         x = x.to(self.device)
+#         x = self.block_input(x)
 
-        if self.block_output is not None:
-            presum_out = self.block_output(x)
-            x = x + presum_out
+#         if self.block_output is not None:
+#             presum_out = self.block_output(x)
+#             x = x + presum_out
 
-        if relu:
-            x = nn.ReLU(inplace=True)(x)
+#         if relu:
+#             x = nn.ReLU(inplace=True)(x)
 
-        # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
-        if center:
-            center_coord = x.shape[-1] // 2
-            x = x[:, :, center_coord, center_coord]
+#         # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
+#         if center:
+#             center_coord = x.shape[-1] // 2
+#             x = x[:, :, center_coord, center_coord]
 
-            if self.use_sae:
-                x = self.map(x)
-                x = x[:, :, None, None]
+#             if self.use_sae:
+#                 x = self.map(x)
+#                 x = x[:, :, None, None]
 
-        return x
+#         return x

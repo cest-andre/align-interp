@@ -14,11 +14,12 @@ if __name__ == "__main__":
     parser.add_argument('--acts_path', type=str)
     parser.add_argument('--ckpt_dir', type=str)
     parser.add_argument('--relu', action='store_true', default=False)
+    parser.add_argument('--nmf', action='store_true', default=False)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--start_epoch', type=int, default=0)
     parser.add_argument('--expansion', type=int, default=32)
-    parser.add_argument('--topk', type=int, default=32)
+    parser.add_argument('--topk', type=int, default=0)
     parser.add_argument('--num_input_dims', type=int, default=0)
     parser.add_argument('--archetype_k', type=int, default=0)  # value used in paper = 32000
     parser.add_argument('--device', type=int)
@@ -33,7 +34,8 @@ if __name__ == "__main__":
     if args.relu:
         acts_data = torch.clamp(acts_data, min=0)
 
-    acts_data, _, _ = LN(acts_data)
+    if not args.nmf:
+        acts_data, _, _ = LN(acts_data)
 
     num_dims = args.num_input_dims
     if num_dims > 0 and num_dims < acts_data.shape[1]:
@@ -56,7 +58,7 @@ if __name__ == "__main__":
     adam_beta1 = 0.9
     adam_beta2 = 0.999
     aux_alpha = 1
-    l1_lambda = 1e-8
+    l1_lambda = 1e-1
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -82,7 +84,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_{args.expansion}exp_archetype' if args.topk > 0 else f'vanilla_1e-8lambda_{args.expansion}exp'
+    label = f'top{args.topk}_3x3_{args.expansion}exp' if args.topk > 0 else f'vanilla_3x3_1e-1lambda_{args.expansion}exp'
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
@@ -101,21 +103,21 @@ if __name__ == "__main__":
             latents, acts_hat, preact_feats, num_dead = sae(acts)
 
             mse_loss = mse_scale * mse(acts_hat, acts, reduction="none").sum(-1)
-            # weighted_latents = latents * sae.W_dec.norm(dim=1)
-            # sparsity = weighted_latents.norm(p=1, dim=-1)
+            weighted_latents = latents * sae.W_dec.norm(dim=1)
+            sparsity = latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
-            # total_l1 += sparsity.mean().cpu().detach().numpy()
+            total_l1 += sparsity.mean().cpu().detach().numpy()
             total_dead += num_dead.cpu().numpy()
 
             loss = mse_loss.mean()
 
-            #   REANIMATE LOSS!!!  Credit to Thomas Fel
-            is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
-            # we push the pre_codes (before relu) towards the positive orthant
-            reanim_loss = (preact_feats * is_dead[None, :]).mean()
+            # #   REANIMATE LOSS!!!  Credit to Thomas Fel
+            # is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
+            # # we push the pre_codes (before relu) towards the positive orthant
+            # reanim_loss = (preact_feats * is_dead[None, :]).mean()
 
-            loss -= reanim_loss * 1e-3
+            # loss -= reanim_loss * 1e-3
 
             # #  Auxiliary loss (prevents dead latents)
             # if dead_acts_recon is not None:
@@ -125,17 +127,20 @@ if __name__ == "__main__":
 
             #     loss += aux_loss.mean()
 
-            # loss += l1_lambda * sparsity.mean()
+            loss += l1_lambda * sparsity.mean()
 
             loss.backward()
             optimizer.step()
+
+            if args.nmf:
+                sae.W_dec.data = torch.clamp(sae.W_dec.data, min=0, max=None)
 
         print(f"Average mse:  {total_mse / i}")
         all_mses.append(total_mse / i)
         print(f"Average L1:  {total_l1 / i}")
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 50 == 0:
+        if (ep+1) % 100 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
             torch.save(optimizer.state_dict(), f"{args.ckpt_dir}/{label}_opt_states_{ep+1}ep.pth")
         

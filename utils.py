@@ -4,8 +4,16 @@ from PIL import Image
 import numpy as np
 import torch
 from torchvision import transforms, utils
+import nimfa
 
 from sae import LN
+
+
+def sparse_nmf(acts, rank):
+    snmf = nimfa.Snmf(acts, seed=None, rank=rank, max_iter=30, version='l', beta=1e-4, i_conv=10, w_min_change=0)
+    results = snmf()
+
+    return results.basis()
 
 
 def sort_acts(all_acts, save_count):
@@ -112,3 +120,14 @@ def pairwise_jaccard(x, y):
         scores.append(top_score)
 
     return np.mean(np.array(scores))
+
+
+def neural_alignment(source, target):
+    metric = Linear()
+    print(f"Ridge scores: {metric.fit_kfold_ridge(x=source, y=target)}\n")
+
+    # results = pairwise_corr(dnn_acts, voxel_acts)
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
+    # score = pairwise_jaccard(dnn_acts, voxel_acts)
+    # print(f'Jaccard pairwise: {score}')

@@ -1,40 +1,63 @@
 import argparse
 from pathlib import Path
 import os
+import sys
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import torchvision
-from torchvision import models, transforms
-# from thingsvision import get_extractor
+from torchvision import transforms
 
-from sae import ModelWrapper, LN
+sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
+from src.alignment.linear import Linear
+
+from sae import LN
 from utils import sort_acts, save_top_imgs, get_coco_imgs
 from monkey_utils import get_mm_imgs
 
 
-def get_activations(extractor, x, module_name, neuron_coord=None, channel_id=None, use_center=False):
+def get_cnn_acts(extractor, x, module_name, neuron_coord=None, channel_id=None, use_center=False):
     if len(x.shape) == 3:
         x = torch.unsqueeze(x, 0)
 
     x = torch.unsqueeze(x, 0)
 
-    activations = extractor.extract_features(
+    acts = extractor.extract_features(
         batches=x,
         module_name=module_name,
         flatten_acts=False
     )
 
     if use_center:
-        neuron_coord = activations.shape[-1] // 2
+        neuron_coord = acts.shape[-1] // 2
 
     if neuron_coord is not None:
-        activations = activations[:, :, neuron_coord, neuron_coord]
+        acts = acts[:, :, neuron_coord, neuron_coord]
 
     if channel_id is not None:
-        activations = activations[:, channel_id]
+        acts = acts[:, channel_id]
 
-    return activations
+    return acts
+
+
+def get_vit_acts(extractor, x, module_name, use_cls_token=False):
+    if len(x.shape) == 3:
+        x = torch.unsqueeze(x, 0)
+
+    x = torch.unsqueeze(x, 0)
+
+    acts = extractor.extract_features(
+        batches=x,
+        module_name=module_name,
+        flatten_acts=False
+    )
+
+    if use_cls_token:
+        acts = acts[:, -1, :]
+    else:  #  use center image token patch
+        acts = acts[:, (acts.shape[1]-1) // 2, :]
+
+    return acts
 
 
 def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weights=None, batch_size=2048):
@@ -71,9 +94,21 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
                 all_imgs.append(input.cpu())
 
         inputs = norm_transform(inputs.to(device))
-        acts = model(inputs, relu=True, center=True)
 
-        # acts = get_activations(extractor, inputs, layer_name, None, None, use_center=True)
+        if 'vit' in extractor.model_name:
+            acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=False)
+        else:
+            acts = get_cnn_acts(extractor, inputs, layer_name, use_center=True)
+
+        acts = torch.clamp(torch.tensor(acts, device=device), min=0, max=None)
+
+        # #   Obtain activations for all patches rather than center-only.
+        # #   TODO:  maybe grab just center 3x3 or something?  would scale down from 49, still a 9x bump in data.
+        # #          could also grab center and 4 corners if 9x is also too much.
+        # acts = model(inputs, relu=False, center=False)
+        # center_coord = acts.shape[-1] // 2
+        # acts = acts[:, :, center_coord-1:center_coord+2, center_coord-1:center_coord+2]
+        # acts = torch.flatten(torch.permute(acts, (0, 2, 3, 1)), start_dim=0, end_dim=-2)
 
         if sae_weights is not None:
             acts, _, _ = LN(acts)
@@ -81,13 +116,11 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
             if 'bn' in sae_weights.keys():
                 acts = sae_weights['bn'](acts)
 
-            # acts = torch.nn.ReLU()(acts @ sae_weights['W_dec'].T)
-
-            #   topk activation SAE
-            topk_res = torch.topk(acts, k=256, dim=-1)
-            values = torch.nn.ReLU()(topk_res.values)
-            acts = torch.zeros_like(acts, device=acts.device)
-            acts.scatter_(-1, topk_res.indices, values)
+            # #   topk activation SAE
+            # topk_res = torch.topk(acts, k=64, dim=-1)
+            # values = torch.nn.ReLU()(topk_res.values)
+            # acts = torch.zeros_like(acts, device=acts.device)
+            # acts.scatter_(-1, topk_res.indices, values)
 
             acts = torch.nn.ReLU()(acts)
 
@@ -113,19 +146,35 @@ def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, 
         save_top_imgs(all_imgs[sorted_idx[:9]], save_img_dir, i)
 
 
+def dnn_align(source_acts, target_acts):
+    for p in range(25, 125, 25):
+        subset_idx = int(source_acts.shape[0] * (p / 100))
+        metric = Linear()
+        print(f"Ridge scores: {metric.fit_kfold_ridge(x=source_acts[:subset_idx].cpu().to(torch.float), y=target_acts[:subset_idx].cpu().to(torch.float))}\n")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--img_dir', type=str)
+    parser.add_argument('--img_dir', type=str, default='')
     parser.add_argument('--save_img_dir', type=str, default='')
     parser.add_argument('--save_act_dir', type=str, default='')
-    parser.add_argument('--layer_name', type=str)
+    parser.add_argument('--layer_name', type=str, default='')
     parser.add_argument('--sae_name', type=str, default=None)
     parser.add_argument('--sae_weights_dir', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--source_acts_path', type=str, default='')
+    parser.add_argument('--target_acts_path', type=str, default='')
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    
+    # source_acts = torch.clamp(torch.tensor(np.load(args.source_acts_path)), min=0, max=None)
+    # target_acts = torch.clamp(torch.tensor(np.load(args.target_acts_path)), min=0, max=None)
+    # dnn_align(source_acts, target_acts)
+    # exit()
+
+    from thingsvision import get_extractor
 
     # model_name = 'resnet50'
     # param_name = {'weights': 'IMAGENET1K_V2'}
@@ -133,16 +182,19 @@ if __name__ == '__main__':
     # model_name = 'resnet18'
     # param_name = {'weights': 'IMAGENET1K_V1'}
 
-    # extractor = get_extractor(
-    #     model_name=model_name,
-    #     source='torchvision',
-    #     device=device,
-    #     pretrained=True,
-    #     model_parameters=param_name
-    # )
+    model_name = 'vit_l_16'
+    param_name = {'weights': 'IMAGENET1K_V1'}
 
-    model = models.resnet50(weights='IMAGENET1K_V2').to(device)
-    model = ModelWrapper(model, None, device)
+    extractor = get_extractor(
+        model_name=model_name,
+        source='torchvision',
+        device=device,
+        pretrained=True,
+        model_parameters=param_name
+    )
+
+    # model = models.resnet50(weights='IMAGENET1K_V2').to(device)
+    # model = ModelWrapper(model, None, device)
 
     sae_states = None
     save_img_dir = None
@@ -152,17 +204,17 @@ if __name__ == '__main__':
         sae_states['W_enc'] = sae_states['W_enc'].to(device)
         sae_states['b_enc'] = sae_states['b_enc'].to(device)
 
-        if 'archetype' in args.sae_name:
-            #   TODO: load encoder batch norm weights?  or maybe init a layer and load weights into it?
-            bn = torch.nn.BatchNorm1d(sae_states['W_enc'].shape[-1])
-            bn_states = {}
-            for state in sae_states.keys():
-                if 'enc_bn' in state:
-                    bn_states[state.replace('enc_bn.', '')] = sae_states[state]
+        # # if 'archetype' in args.sae_name or 'nmf' in args.sae_name:
+        # #   TODO: load encoder batch norm weights?  or maybe init a layer and load weights into it?
+        # bn = torch.nn.BatchNorm1d(sae_states['W_enc'].shape[-1])
+        # bn_states = {}
+        # for state in sae_states.keys():
+        #     if 'enc_bn' in state:
+        #         bn_states[state.replace('enc_bn.', '')] = sae_states[state]
 
-            bn.load_state_dict(bn_states)
-            bn.to(device)
-            sae_states['bn'] = bn
+        # bn.load_state_dict(bn_states)
+        # bn.to(device)
+        # sae_states['bn'] = bn
 
         # sae_states['W_dec'] = sae_states['W_dec'].to(device)
 
@@ -179,9 +231,11 @@ if __name__ == '__main__':
     else:
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    all_acts, _ = get_img_acts(model, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
+    all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
     Path(save_act_dir).mkdir(parents=True, exist_ok=True)
-    np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
+    # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
+ 
+    np.save(os.path.join(save_act_dir, f'{args.layer_name}_center_train.npy'), np.array(all_acts))
 
     # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
     # save_top_act_imgs(

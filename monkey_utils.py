@@ -8,6 +8,7 @@ from PIL import Image
 
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
 from src.alignment.linear import Linear
+from utils import sparse_nmf
 
 
 #   mm = ManyMonkeys electrophys dataset.
@@ -55,10 +56,10 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
-    # get_mm_responses('/mnt/cogsci/ManyMonkeys/many_monkeys2.h5', 'bento')
-    # get_mm_imgs('/mnt/cogsci/ManyMonkeys/many_monkeys2.h5')
-
     dnn_acts = np.load(args.dnn_acts_path)
+    dnn_acts = np.clip(dnn_acts, a_min=0, a_max=None)
+    # nmf_coeffs = sparse_nmf(dnn_acts, 64)
+
     responses = get_mm_responses(args.mm_path, args.monkey_name)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 
