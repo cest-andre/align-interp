@@ -1,46 +1,20 @@
 import os
+import sys
+from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
+sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
+from src.alignment.linear import Linear
+
 from sae import SAE
 from utils import pairwise_corr, pairwise_jaccard
 
 
-#   NOTE:  code derived from https://colab.research.google.com/github/anthropics/toy-models-of-superposition/blob/main/toy_models.ipynb
-
-
-class ToySAE(nn.Module):
-    def __init__(
-        self, 
-        n_inputs,
-        n_hidden,
-        device
-    ):
-        super().__init__()
-        self.n_inputs = n_inputs
-        self.n_hidden = n_hidden
-        self.W_enc = nn.Parameter(torch.empty((n_inputs, n_hidden), device=device))
-        self.W_dec = nn.Parameter(torch.empty((n_hidden, n_inputs), device=device))
-        nn.init.xavier_normal_(self.W_enc)
-        nn.init.xavier_normal_(self.W_dec)
-        # self.b_final = nn.Parameter(torch.zeros((n_features), device=device))
-
-        self.b_enc = nn.Parameter(torch.zeros(n_hidden, device=device))
-        self.b_dec = nn.Parameter(torch.zeros(n_inputs, device=device))
-
-    def forward(self, x):
-        # features: [..., instance, n_features]
-        # W: [instance, n_features, n_hidden]
-        hidden = (x @ self.W_enc) + self.b_enc #torch.einsum("...if,ifh->...ih", features, self.W)
-        hidden = F.relu(hidden)
-        out = (hidden @ self.W_dec) + self.b_dec #torch.einsum("...ih,ifh->...if", hidden, self.W)
-        out = F.relu(out)
-        return out, hidden
-
-
+#   NOTE:  toy model code derived from https://colab.research.google.com/github/anthropics/toy-models-of-superposition/blob/main/toy_models.ipynb
 class Model(nn.Module):
     def __init__(
         self, 
@@ -55,13 +29,15 @@ class Model(nn.Module):
         self.n_hidden = n_hidden
         self.W = nn.Parameter(torch.empty((n_features, n_hidden), device=device))
         nn.init.xavier_normal_(self.W)
-        # self.b_final = nn.Parameter(torch.zeros((n_features), device=device))
+        self.b_final = nn.Parameter(torch.zeros((n_features), device=device))
 
         if feature_probability is None:
             feature_probability = torch.ones(()) * 0.1
         self.feature_probability = feature_probability.to(device)
         if importance is None:
-            importance = torch.ones(())
+            #   NOTE: change importance to be a simple powerlaw of x^-2, sampled 64 times uniformly from 1 to 3 (importance=1 to 0.1)
+            # importance = torch.ones(())
+            importance = torch.pow(torch.arange(1, 3, (2 / self.n_features)), -2)
         self.importance = importance.to(device)
 
     def forward(self, features):
@@ -70,7 +46,7 @@ class Model(nn.Module):
         hidden = features @ self.W #torch.einsum("...if,ifh->...ih", features, self.W)
         hidden = F.relu(hidden)
         out = hidden @ self.W.T #torch.einsum("...ih,ifh->...if", hidden, self.W)
-        out = out# + self.b_final
+        out = out + self.b_final
         out = F.relu(out)
         return out, hidden
 
@@ -83,6 +59,46 @@ class Model(nn.Module):
         )
         return batch
 
+        
+class ToySAE(nn.Module):
+    def __init__(
+        self, 
+        n_inputs,
+        n_hidden,
+        device,
+        topk=None
+    ):
+        super().__init__()
+        self.n_inputs = n_inputs
+        self.n_hidden = n_hidden
+        self.topk = topk
+        self.device = device
+
+        self.W_enc = nn.Parameter(torch.empty((n_inputs, n_hidden), device=device))
+        self.W_dec = nn.Parameter(torch.empty((n_hidden, n_inputs), device=device))
+        nn.init.xavier_normal_(self.W_enc)
+        nn.init.xavier_normal_(self.W_dec)
+        self.b_enc = nn.Parameter(torch.zeros(n_hidden, device=device))
+        self.b_dec = nn.Parameter(torch.zeros(n_inputs, device=device))
+
+    def forward(self, x):
+        # features: [..., instance, n_features]
+        # W: [instance, n_features, n_hidden]
+        hidden = (x @ self.W_enc) + self.b_enc #torch.einsum("...if,ifh->...ih", features, self.W)
+        preact_feats = hidden
+        hidden = F.relu(hidden)
+
+        if self.topk is not None:
+            topk_res = torch.topk(hidden, k=self.topk, dim=-1)
+            values = nn.ReLU()(topk_res.values)
+            hidden = torch.zeros_like(hidden, device=self.device)
+            hidden.scatter_(-1, topk_res.indices, values)
+
+        out = (hidden @ self.W_dec) + self.b_dec #torch.einsum("...ih,ifh->...if", hidden, self.W)
+        out = F.relu(out)
+
+        return out, hidden, preact_feats
+
 
 if __name__ == '__main__':
     #   3 features with 0.1 freq and equal importance (1).  Data produced with seed=1.
@@ -91,116 +107,106 @@ if __name__ == '__main__':
     #
     #   ~ indicates that it is actually closer to [0.75, 0.25].
     #   0s are in reality negatives to reduce interference, but here we're focused on activations.
-    torch.manual_seed(1)
-    device = f"cuda:7" if torch.cuda.is_available() else "cpu"
-    n_feats = 1024
-    n_neurons = 256
-    savedir = f'/home/alongon/data/toy_data/{n_feats}feats_{n_neurons}neurons'
+    seed = 1
+    device = f"cuda:4" if torch.cuda.is_available() else "cpu"
+    n_feats = 64
+    n_neurons = 32
+    savedir = f'/home/alongon/data/toy_data/{n_feats}feats_{n_neurons}neurons_bias'
+    Path(savedir).mkdir(parents=True, exist_ok=True)
 
-    # #   TRAIN MODELS AND OBTAIN RAW NEURON ACTS
-    # n_batch=1024
-    # steps=10_000
-    # print_freq=1000
+    #   GENERATE DATA, TRAIN MODEL, AND OBTAIN RAW NEURON ACTS
+    torch.manual_seed(seed)
+    n_batch=1024
+    steps=10_000
+    print_freq=1000
 
-    # dataset = np.load(os.path.join(savedir, 'dataset.npy'))
-    # dataset = TensorDataset(torch.tensor(dataset, dtype=torch.float))
-    # dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+    model = Model(n_feats, n_neurons, device)
+    opt = torch.optim.AdamW(list(model.parameters()), lr=1e-3)
 
-    # model = Model(n_feats, n_neurons, device)
-    # opt = torch.optim.AdamW(list(model.parameters()), lr=1e-3)
+    # if seed == 0:
+    #     all_batches = []
+    #     for i in range(steps):
+    #         batch = model.generate_batch(n_batch)
+    #         all_batches += batch.detach().cpu().numpy().tolist()
+    #     np.save(os.path.join(savedir, 'dataset.npy'), np.array(all_batches))
 
-    # all_batches = []
+    dataset = np.load(os.path.join(savedir, 'dataset.npy'))
+    dataset = TensorDataset(torch.tensor(dataset, dtype=torch.float))
+    dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+
     # for i, batch in enumerate(dataloader, 0):
     #     batch = batch[0].to(device)
-    # # for i in range(steps):
-    #     opt.zero_grad(set_to_none=True)
-    #     batch = model.generate_batch(n_batch)
+
     #     out, _ = model(batch)
     #     error = (model.importance*(batch.abs() - out)**2)
     #     loss = error.mean()
 
     #     loss.backward()
     #     opt.step()
+    #     opt.zero_grad(set_to_none=True)
 
-    #     # all_batches += batch.detach().cpu().numpy().tolist()
-        
-    #     # if hooks:
-    #     #     hook_data = dict(model=model,
-    #     #                     step=step, 
-    #     #                     opt=opt,
-    #     #                     error=error,
-    #     #                     loss=loss,
-    #     #                     lr=step_lr)
-    #     #     for h in hooks:
-    #     #     h(hook_data)
     #     if i % print_freq == 0 or (i + 1 == steps):
     #         print(loss.item())
 
-    # # np.save(os.path.join(savedir, 'dataset.npy'), np.array(all_batches))
-    # print(model.W[:10, :10])
-    # # exit()
-    # model.eval()
-    # #   TODO: collect activations of neurons to shared data (save data generated from one trial).  Then proceed
-    # #         to train a vanilla SAE over a portion.  Then pass other portion to trained SAE to get latents.
-    # #         Repeat for other model (save raw neuron and sae latent acts).  Then perform pairwise corrs over this.
-    # all_acts = []
-    # for i, batch in enumerate(dataloader, 0):
-    #     batch = batch[0].to(device)
-    #     _, acts = model(batch)
-    #     all_acts += acts.detach().cpu().numpy().tolist()
+    # torch.save(model.state_dict(), os.path.join(savedir, f'model{seed}_weights.pth'))
 
-    # np.save(os.path.join(savedir, 'model2_raw_neuron_acts.npy'), np.array(all_acts))
+    model.load_state_dict(torch.load(os.path.join(savedir, f'model{seed}_weights.pth')))
+    model.eval()
+    all_acts = []
+    all_errors = []
+    for i, batch in enumerate(dataloader, 0):
+        batch = batch[0].to(device)
+       
+        out, acts = model(batch)
+        all_acts += acts.detach().cpu().numpy().tolist()
+        all_errors += ((batch.abs() - out)**2).detach().cpu().numpy().tolist()
 
-    # #   Train SAE.  Seed=2 for good results on Model 1.
+    np.save(os.path.join(savedir, f'model{seed}_raw_neuron_acts.npy'), np.array(all_acts))
+    np.save(os.path.join(savedir, f'model{seed}_recon_errors.npy'), np.array(all_errors))
+    exit()
+
+    # #   Train SAE.
     # train_split = 0.8
     # n_batch=1024
-    # l1_lambda = 1e-8
-    # aux_alpha = 1
-    # topk = 32
+    # l1_lambda = 1e-1
+    # topk = 7
     # print_freq=1000
 
-    # data = np.load(os.path.join(savedir, 'model2_raw_neuron_acts.npy'))
+    # torch.manual_seed(0)
+    # data = np.load(os.path.join(savedir, f'model{seed}_raw_neuron_acts.npy'))
     # dataset = TensorDataset(torch.tensor(data[:int(data.shape[0]*0.8)], dtype=torch.float))
     # dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
 
-    # sae = ToySAE(n_neurons, n_feats, device)
-    # # sae = SAE(n_neurons, expansion=n_feats//n_neurons, device=device, topk=topk, auxk=128, dead_steps_threshold=1000)
+    # sae = ToySAE(n_neurons, n_feats, device, topk=topk)
     # opt = torch.optim.AdamW(list(sae.parameters()), lr=1e-3)
-    # mse = torch.nn.functional.mse_loss
-    # dead_acts_recon = None
     # for i, batch in enumerate(dataloader, 0):
     #     batch = batch[0].to(device)
     #     opt.zero_grad(set_to_none=True)
 
-    #     out, latents = sae(batch)
-    #     # latents, out, dead_acts_recon, num_dead = sae(batch)
+    #     out, latents, preact_feats = sae(batch)
 
     #     error = (batch.abs() - out)**2
     #     loss = error.mean()
 
-    #     #  Auxiliary loss (prevents dead latents for topk)
-    #     if dead_acts_recon is not None:
-    #         error = batch - out
-    #         aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1) / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
-    #         aux_loss = aux_alpha * aux_mse.nan_to_num(0)
+    #     #   REANIMATE LOSS!!!  Credit to Thomas Fel
+    #     is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
+    #     # we push the pre_codes (before relu) towards the positive orthant
+    #     reanim_loss = (preact_feats * is_dead[None, :]).mean()
 
-    #         loss += aux_loss.mean()
+    #     loss -= reanim_loss * 1e-3
 
     #     weighted_latents = latents * sae.W_dec.norm(dim=1)
     #     sparsity = weighted_latents.norm(p=1, dim=-1)
-
-    #     loss += l1_lambda * sparsity.mean()
+    #     # loss += l1_lambda * sparsity.mean()
 
     #     loss.backward()
     #     opt.step()
 
     #     if i % print_freq == 0:
     #         print(f'MSE:  {error.mean().item()}')
-    #         print(f'L1:  {sparsity.mean().item()}')
+    #         print(f'L1:  {sparsity.mean().item()}\n')
     #         # print(f'Num dead: {num_dead}')
 
-    # # print(sae.W_enc)
-    # # print(sae.W_dec)
     # sae.eval()
 
     # dataset = TensorDataset(torch.tensor(data[-int(data.shape[0]*(1-train_split)):], dtype=torch.float))
@@ -209,40 +215,45 @@ if __name__ == '__main__':
     # all_acts = []
     # for i, batch in enumerate(dataloader, 0):
     #     batch = batch[0].to(device)
+    #     _, latents, _ = sae(batch)
 
-    #     # latents = F.relu(batch @ sae.W_dec.T)
-    #     _, latents = sae(batch)
     #     all_acts += latents.detach().cpu().numpy().tolist()
 
-    # np.save(os.path.join(savedir, f'model2_1e-8lambda_sae_acts.npy'), np.array(all_acts))
+    # np.save(os.path.join(savedir, f'model{seed}_top{topk}_sae_acts.npy'), np.array(all_acts))
     # exit()
 
     #   Pairwise pearson correlation and jaccard scores.
     train_split = 0.8
+    source_seed = 0
+    target_seed = 1
 
-    # acts1 = np.load(os.path.join(savedir, 'model1_raw_neuron_acts.npy'))
-    # acts1 = torch.tensor(acts1[-int(acts1.shape[0]*(1-train_split)):], device=device)
-    # acts2 = np.load(os.path.join(savedir, 'model2_raw_neuron_acts.npy'))
-    # acts2 = torch.tensor(acts2[-int(acts2.shape[0]*(1-train_split)):], device=device)
+    source_acts = np.load(os.path.join(savedir, f'model{source_seed}_raw_neuron_acts.npy'))
+    source_acts = torch.tensor(source_acts[-int(source_acts.shape[0]*(1-train_split)):], device=device)
+    target_acts = np.load(os.path.join(savedir, f'model{target_seed}_raw_neuron_acts.npy'))
+    target_acts = torch.tensor(target_acts[-int(target_acts.shape[0]*(1-train_split)):], device=device)
 
     # print('---Base Neurons---')
+    # # results = pairwise_corr(acts1, acts2)
+    # # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
+    # # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
+    # # score = pairwise_jaccard(acts1, acts2)
+    # # print(f'Jaccard pairwise: {score}')
+    metric = Linear()
+    print(f"Ridge scores: {metric.fit_kfold_ridge(x=source_acts.cpu().to(torch.float), y=target_acts.cpu().to(torch.float))}")
+
+    source_acts = np.load(os.path.join(savedir, f'model{source_seed}_top{topk}_sae_acts.npy'))
+    source_acts = torch.tensor(source_acts, device=device)
+    # target_acts = np.load(os.path.join(savedir, f'model{target_seed}_top{topk}_sae_acts.npy'))
+    # target_acts = torch.tensor(target_acts, device=device)
+
+    print('---SAE Latents---')
     # results = pairwise_corr(acts1, acts2)
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
     # score = pairwise_jaccard(acts1, acts2)
     # print(f'Jaccard pairwise: {score}')
-
-    acts1 = np.load(os.path.join(savedir, 'model1_1e-8lambda_sae_acts.npy'))
-    acts1 = torch.tensor(acts1[-int(acts1.shape[0]*(1-train_split)):], device=device)
-    acts2 = np.load(os.path.join(savedir, 'model2_1e-8lambda_sae_acts.npy'))
-    acts2 = torch.tensor(acts2[-int(acts2.shape[0]*(1-train_split)):], device=device)
-
-    print('---SAE Latents---')
-    results = pairwise_corr(acts1, acts2)
-    print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
-    print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
-    score = pairwise_jaccard(acts1, acts2)
-    print(f'Jaccard pairwise: {score}')
-
-
-    #   TODO:  Linear mapping between models.
+    metric = Linear()
+    print(f"Ridge scores: {metric.fit_kfold_ridge(x=source_acts.cpu().to(torch.float), y=target_acts.cpu().to(torch.float))}")
+    # results = pairwise_corr(source_acts, target_acts)
+    # sae_sae_score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
+    # print(sae_sae_score)

@@ -12,7 +12,7 @@ from sklearn.cluster import KMeans
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
 from src.alignment.linear import Linear
 
-from utils import save_top_imgs, pairwise_corr, pairwise_jaccard
+from utils import save_top_imgs, pairwise_corr, pairwise_jaccard, RSA
 
 
 def extract_shared_for_subj(split_ids_path, nsd_path, subj_id):
@@ -95,8 +95,24 @@ def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj, dnn_acts, voxel_acts,
     voxel_acts = torch.tensor(voxel_acts, device=device)
 
     metric = Linear()
-    # print(f"Linear scores: {metric.fit_kfold_score(x=dnn_acts, y=voxel_acts)}")
-    print(f"Ridge scores: {metric.fit_kfold_ridge(x=dnn_acts.cpu().to(torch.float), y=voxel_acts.cpu().to(torch.float))}\n")
+    scores = metric.fit_kfold_ridge(x=dnn_acts.cpu().to(torch.float), y=voxel_acts.cpu().to(torch.float))
+    print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
+    results = pairwise_corr(dnn_acts, voxel_acts)
+    pairwise_score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
+    print(f'Pairwise score: {pairwise_score}')
+    rsa_score = RSA(dnn_acts.cpu().numpy(), voxel_acts.cpu().numpy())[0]
+    print(f'RSA score: {rsa_score}')
+    exit()
+
+    for p in range(25, 125, 25):
+        subset_idx = int(dnn_acts.shape[0] * (p / 100))
+        metric = Linear()
+        scores = metric.fit_kfold_ridge(
+            x=dnn_acts[:subset_idx].cpu().to(torch.float),
+            y=voxel_acts[:subset_idx].cpu().to(torch.float),
+            #val_set={'x': source_val, 'y': target_val}
+        )
+        print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
 
     # results = pairwise_corr(dnn_acts, voxel_acts)
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')

@@ -12,7 +12,7 @@ sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-align
 from src.alignment.linear import Linear
 
 from sae import LN
-from utils import sort_acts, save_top_imgs, get_coco_imgs
+from utils import sort_acts, save_top_imgs, get_coco_imgs, pairwise_corr, RSA
 from monkey_utils import get_mm_imgs
 
 
@@ -96,7 +96,7 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
         inputs = norm_transform(inputs.to(device))
 
         if 'vit' in extractor.model_name:
-            acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=False)
+            acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=True)
         else:
             acts = get_cnn_acts(extractor, inputs, layer_name, use_center=True)
 
@@ -105,7 +105,6 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
         # #   Obtain activations for all patches rather than center-only.
         # #   TODO:  maybe grab just center 3x3 or something?  would scale down from 49, still a 9x bump in data.
         # #          could also grab center and 4 corners if 9x is also too much.
-        # acts = model(inputs, relu=False, center=False)
         # center_coord = acts.shape[-1] // 2
         # acts = acts[:, :, center_coord-1:center_coord+2, center_coord-1:center_coord+2]
         # acts = torch.flatten(torch.permute(acts, (0, 2, 3, 1)), start_dim=0, end_dim=-2)
@@ -116,11 +115,11 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
             if 'bn' in sae_weights.keys():
                 acts = sae_weights['bn'](acts)
 
-            # #   topk activation SAE
-            # topk_res = torch.topk(acts, k=64, dim=-1)
-            # values = torch.nn.ReLU()(topk_res.values)
-            # acts = torch.zeros_like(acts, device=acts.device)
-            # acts.scatter_(-1, topk_res.indices, values)
+            #   topk activation SAE
+            topk_res = torch.topk(acts, k=128, dim=-1)
+            values = torch.nn.ReLU()(topk_res.values)
+            acts = torch.zeros_like(acts, device=acts.device)
+            acts.scatter_(-1, topk_res.indices, values)
 
             acts = torch.nn.ReLU()(acts)
 
@@ -147,10 +146,35 @@ def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, 
 
 
 def dnn_align(source_acts, target_acts):
+    metric = Linear()
+    scores = metric.fit_kfold_ridge(
+        x=source_acts.cpu().to(torch.float),
+        y=target_acts.cpu().to(torch.float),
+    )
+    print(f"Ridge score: {np.array(scores).mean()}")
+    results = pairwise_corr(source_acts, target_acts)
+    score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
+    print(f"Pairwise score: {score}")
+    # score = RSA(source_acts, target_acts)[0]
+    # print(score)
+    exit()
+
+    # results = pairwise_corr(source_acts, target_acts)
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
+    # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
+
+    # source_val = source_acts[-10000:].cpu().to(torch.float)
+    # target_val = target_acts[-10000:].cpu().to(torch.float)
+    # source_acts, target_acts = source_acts[:40000], target_acts[:40000] 
     for p in range(25, 125, 25):
         subset_idx = int(source_acts.shape[0] * (p / 100))
         metric = Linear()
-        print(f"Ridge scores: {metric.fit_kfold_ridge(x=source_acts[:subset_idx].cpu().to(torch.float), y=target_acts[:subset_idx].cpu().to(torch.float))}\n")
+        scores = metric.fit_kfold_ridge(
+            x=source_acts[:subset_idx].cpu().to(torch.float),
+            y=target_acts[:subset_idx].cpu().to(torch.float),
+            #val_set={'x': source_val, 'y': target_val}
+        )
+        print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
 
 
 if __name__ == '__main__':
@@ -169,21 +193,22 @@ if __name__ == '__main__':
 
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     
-    # source_acts = torch.clamp(torch.tensor(np.load(args.source_acts_path)), min=0, max=None)
-    # target_acts = torch.clamp(torch.tensor(np.load(args.target_acts_path)), min=0, max=None)
-    # dnn_align(source_acts, target_acts)
-    # exit()
+    if len(args.source_acts_path) > 0:
+        source_acts = torch.clamp(torch.tensor(np.load(args.source_acts_path)), min=0, max=None)
+        target_acts = torch.clamp(torch.tensor(np.load(args.target_acts_path)), min=0, max=None)
+        dnn_align(source_acts, target_acts)
+        exit()
 
     from thingsvision import get_extractor
 
-    # model_name = 'resnet50'
-    # param_name = {'weights': 'IMAGENET1K_V2'}
+    model_name = 'resnet50'
+    param_name = {'weights': 'IMAGENET1K_V2'}
 
     # model_name = 'resnet18'
     # param_name = {'weights': 'IMAGENET1K_V1'}
 
-    model_name = 'vit_l_16'
-    param_name = {'weights': 'IMAGENET1K_V1'}
+    # model_name = 'vit_l_16'
+    # param_name = {'weights': 'IMAGENET1K_V1'}
 
     extractor = get_extractor(
         model_name=model_name,
@@ -192,9 +217,7 @@ if __name__ == '__main__':
         pretrained=True,
         model_parameters=param_name
     )
-
-    # model = models.resnet50(weights='IMAGENET1K_V2').to(device)
-    # model = ModelWrapper(model, None, device)
+    extractor.model.load_state_dict(torch.load('/home/chkapoor/pytorch-cifar/checkpoint_imagenet/resnet50/seed_2/epoch_78.pth')['net'])
 
     sae_states = None
     save_img_dir = None
@@ -235,7 +258,7 @@ if __name__ == '__main__':
     Path(save_act_dir).mkdir(parents=True, exist_ok=True)
     # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
  
-    np.save(os.path.join(save_act_dir, f'{args.layer_name}_center_train.npy'), np.array(all_acts))
+    np.save(os.path.join(save_act_dir, f'{args.layer_name}_center_patch_train.npy'), np.array(all_acts))
 
     # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
     # save_top_act_imgs(

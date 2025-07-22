@@ -4,16 +4,19 @@ from PIL import Image
 import numpy as np
 import torch
 from torchvision import transforms, utils
-import nimfa
+# import nimfa
+from scipy.stats import kendalltau
+import ot
+from sklearn.model_selection import KFold
 
 from sae import LN
 
 
-def sparse_nmf(acts, rank):
-    snmf = nimfa.Snmf(acts, seed=None, rank=rank, max_iter=30, version='l', beta=1e-4, i_conv=10, w_min_change=0)
-    results = snmf()
+# def sparse_nmf(acts, rank):
+#     snmf = nimfa.Snmf(acts, seed=None, rank=rank, max_iter=30, version='l', beta=1e-4, i_conv=10, w_min_change=0)
+#     results = snmf()
 
-    return results.basis()
+#     return results.basis()
 
 
 def sort_acts(all_acts, save_count):
@@ -82,13 +85,12 @@ def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, bot_ids=None):
 
 #   x and y are torch tensors with shape: (num_data, num_units).  Pairwise corrs obtained between all units.
 def pairwise_corr(x, y):
-    #   TODO: filter dead neurons???  no nonzeros after relu
-    x = torch.clamp(x, min=0)
-    y = torch.clamp(y, min=0)
+    # x = torch.clamp(x, min=0)
+    # y = torch.clamp(y, min=0)
 
     #   Measure sparseness (percent 0) to see if that's what's driving higher corr with SAE latents.
-    print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
-    print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
+    # print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
+    # print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
 
     x, _, _ = LN(x)
     y, _, _ = LN(y)
@@ -131,3 +133,11 @@ def neural_alignment(source, target):
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
     # score = pairwise_jaccard(dnn_acts, voxel_acts)
     # print(f'Jaccard pairwise: {score}')
+
+
+#   Sourced from:  https://github.com/anshksoni/NeuroAIMetrics/blob/main/utils/metrics.py#L193
+def RSA(X, Y):
+    y_coef = 1 - np.corrcoef(Y, dtype=np.float32)
+    x_coef = 1 - np.corrcoef(X, dtype=np.float32)
+
+    return kendalltau(np.triu(y_coef, k=1), np.triu(x_coef, k=1))
