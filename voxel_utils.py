@@ -12,6 +12,7 @@ from sklearn.cluster import KMeans
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-alignment'))
 from src.alignment.linear import Linear
 
+from sae import LN
 from utils import save_top_imgs, pairwise_corr, pairwise_jaccard, RSA
 
 
@@ -51,9 +52,15 @@ def voxel_to_sae(dataloader, sae_weights, device):
     all_sae_acts = []
     for _, vox in enumerate(dataloader):
         vox = vox[0].to(device)
+        vox, _, _ = LN(vox)
 
-        # acts = vox @ sae_weights
-        acts = torch.nn.ReLU()((vox.to(torch.float) @ sae_weights['W_enc']) + sae_weights['b_enc'])
+        acts = (vox.to(torch.float) @ sae_weights['W_enc']) + sae_weights['b_enc']
+
+        #   topk activation SAE
+        topk_res = torch.topk(acts, k=256, dim=-1)
+        values = torch.nn.ReLU()(topk_res.values)
+        acts = torch.zeros_like(acts, device=acts.device)
+        acts.scatter_(-1, topk_res.indices, values)
 
         all_sae_acts += acts.cpu().numpy().tolist()
 
@@ -86,39 +93,41 @@ def viz_voxels():
     #     save_top_cocos(args.coco_dir, coco_ids[sorted_idx[:9]], i, savedir)
 
 
-def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj, dnn_acts, voxel_acts, device):
+def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj, dnn_acts, voxel_acts):
     subj_coco_ids, _ = extract_shared_for_subj(splits_path, nsd_path, subj)
     all_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
     subj_coco_ids = [all_ids.index(str(id)) for id in subj_coco_ids]
+    dnn_acts = dnn_acts[subj_coco_ids]
 
-    dnn_acts = torch.tensor(dnn_acts[subj_coco_ids], device=device)
-    voxel_acts = torch.tensor(voxel_acts, device=device)
+    # metric = Linear()
+    # results = metric.fit_kfold_ridge(x=dnn_acts.to(torch.float), y=voxel_acts.to(torch.float))
+    # score = np.array(results).mean()
 
-    metric = Linear()
-    scores = metric.fit_kfold_ridge(x=dnn_acts.cpu().to(torch.float), y=voxel_acts.cpu().to(torch.float))
-    print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
     results = pairwise_corr(dnn_acts, voxel_acts)
-    pairwise_score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
-    print(f'Pairwise score: {pairwise_score}')
-    rsa_score = RSA(dnn_acts.cpu().numpy(), voxel_acts.cpu().numpy())[0]
-    print(f'RSA score: {rsa_score}')
-    exit()
+    score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
 
-    for p in range(25, 125, 25):
-        subset_idx = int(dnn_acts.shape[0] * (p / 100))
-        metric = Linear()
-        scores = metric.fit_kfold_ridge(
-            x=dnn_acts[:subset_idx].cpu().to(torch.float),
-            y=voxel_acts[:subset_idx].cpu().to(torch.float),
-            #val_set={'x': source_val, 'y': target_val}
-        )
-        print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
+    # print(f'Pairwise score: {pairwise_score}')
+    # rsa_score = RSA(dnn_acts.cpu().numpy(), voxel_acts.cpu().numpy())[0]
+    # print(f'RSA score: {rsa_score}')
+    # exit()
+
+    # for p in range(25, 125, 25):
+    #     subset_idx = int(dnn_acts.shape[0] * (p / 100))
+    #     metric = Linear()
+    #     scores = metric.fit_kfold_ridge(
+    #         x=dnn_acts[:subset_idx].cpu().to(torch.float),
+    #         y=voxel_acts[:subset_idx].cpu().to(torch.float),
+    #         #val_set={'x': source_val, 'y': target_val}
+    #     )
+    #     print(f"Ridge scores: {scores}\nMean: {np.array(scores).mean()}\n")
 
     # results = pairwise_corr(dnn_acts, voxel_acts)
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 1)[0])}')
     # print(f'Pearson pairwise: {torch.mean(torch.max(results, 0)[0])}')
     # score = pairwise_jaccard(dnn_acts, voxel_acts)
     # print(f'Jaccard pairwise: {score}')
+
+    return score
 
 
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
@@ -171,24 +180,24 @@ if __name__ == "__main__":
     # np.save(os.path.join(args.savedir, file_name), subj_voxels)
 
 
-    # #   Extract voxel sae latent acts
-    # device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
-    # subj_voxels = np.load(args.voxel_acts_path)
-    # voxel_ds = TensorDataset(torch.tensor(subj_voxels))
-    # dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
-
-    # sae_weights = torch.load(os.path.join(args.weights_dir, f'subj{args.subj_id}', f'{args.sae_name}.pth'))
-    # sae_weights['W_enc'] = sae_weights['W_enc'].to(device)
-    # sae_weights['b_enc'] = sae_weights['b_enc'].to(device)
-
-    # sae_acts = voxel_to_sae(dataloader, sae_weights, device)
-    # np.save(os.path.join(args.savedir, f'subj{args.subj_id}', 'voxel_sae_acts', f'{args.sae_name}.npy'), np.array(sae_acts))
-
-
-    #   Load DNN coco acts, extract only images that are for subj.  Then load voxel acts (raw or sae) and run pairwise corrs.
+    #   Extract voxel sae latent acts
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
-    dnn_acts = np.load(args.dnn_acts_path)
-    dnn_acts = np.clip(dnn_acts, a_min=0, a_max=None)
-    voxel_acts = np.load(args.voxel_acts_path)
+    subj_voxels = np.load(args.voxel_acts_path)
+    voxel_ds = TensorDataset(torch.tensor(subj_voxels))
+    dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    voxel_dnn_align(args.splits_path, args.nsd_path, args.coco_dir, args.subj_id, dnn_acts, voxel_acts, device)
+    sae_weights = torch.load(os.path.join(args.weights_dir, f'subj{args.subj_id}', f'{args.sae_name}.pth'))
+    sae_weights['W_enc'] = sae_weights['W_enc'].to(device)
+    sae_weights['b_enc'] = sae_weights['b_enc'].to(device)
+
+    sae_acts = voxel_to_sae(dataloader, sae_weights, device)
+    np.save(os.path.join(args.savedir, f'subj{args.subj_id}', 'voxel_sae_acts', f'{args.sae_name}.npy'), np.array(sae_acts))
+
+
+    # #   Load DNN coco acts, extract only images that are for subj.  Then load voxel acts (raw or sae) and run pairwise corrs.
+    # device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    # dnn_acts = np.load(args.dnn_acts_path)
+    # dnn_acts = np.clip(dnn_acts, a_min=0, a_max=None)
+    # voxel_acts = np.load(args.voxel_acts_path)
+
+    # voxel_dnn_align(args.splits_path, args.nsd_path, args.coco_dir, args.subj_id, dnn_acts, voxel_acts, device)

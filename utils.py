@@ -91,9 +91,10 @@ def pairwise_corr(x, y):
     #   Measure sparseness (percent 0) to see if that's what's driving higher corr with SAE latents.
     # print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
     # print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
-
-    x, _, _ = LN(x)
-    y, _, _ = LN(y)
+    print(f'Num dead source: {torch.all(x == 0, dim=0).nonzero().shape[0]}')
+    print(f'Num dead target: {torch.all(y == 0, dim=0).nonzero().shape[0]}')
+    x = x[:, torch.any(x != 0, dim=0).nonzero()[:, 0]]
+    y = y[:, torch.any(y != 0, dim=0).nonzero()[:, 0]]
 
     x_cent = x - torch.mean(x, 0)
     x_ss = torch.sum(torch.pow(x_cent, 2), 0)
@@ -137,6 +138,14 @@ def neural_alignment(source, target):
 
 #   Sourced from:  https://github.com/anshksoni/NeuroAIMetrics/blob/main/utils/metrics.py#L193
 def RSA(X, Y):
+    #   Remove dead latents
+    X = X[:, torch.any(X != 0, dim=0).nonzero()[:, 0]]
+    Y = Y[:, torch.any(Y != 0, dim=0).nonzero()[:, 0]]
+
+    #   Remove dead stimuli (L0=0)
+    X = X[torch.any(X != 0, dim=1).nonzero()[:, 0]].cpu()
+    Y = Y[torch.any(Y != 0, dim=1).nonzero()[:, 0]].cpu()
+    
     y_coef = 1 - np.corrcoef(Y, dtype=np.float32)
     x_coef = 1 - np.corrcoef(X, dtype=np.float32)
 

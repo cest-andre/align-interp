@@ -53,7 +53,7 @@ def get_vit_acts(extractor, x, module_name, use_cls_token=False):
     )
 
     if use_cls_token:
-        acts = acts[:, -1, :]
+        acts = acts[:, 0]
     else:  #  use center image token patch
         acts = acts[:, (acts.shape[1]-1) // 2, :]
 
@@ -97,10 +97,10 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
 
         if 'vit' in extractor.model_name:
             acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=True)
+            acts = torch.tensor(acts, device=device)
         else:
             acts = get_cnn_acts(extractor, inputs, layer_name, use_center=True)
-
-        acts = torch.clamp(torch.tensor(acts, device=device), min=0, max=None)
+            acts = torch.clamp(torch.tensor(acts, device=device), min=0, max=None)
 
         # #   Obtain activations for all patches rather than center-only.
         # #   TODO:  maybe grab just center 3x3 or something?  would scale down from 49, still a 9x bump in data.
@@ -116,7 +116,7 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
                 acts = sae_weights['bn'](acts)
 
             #   topk activation SAE
-            topk_res = torch.topk(acts, k=128, dim=-1)
+            topk_res = torch.topk(acts, k=82, dim=-1)
             values = torch.nn.ReLU()(topk_res.values)
             acts = torch.zeros_like(acts, device=acts.device)
             acts.scatter_(-1, topk_res.indices, values)
@@ -131,14 +131,16 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
     return all_acts, all_imgs
 
 
-def save_top_act_imgs(model, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size, sae_weights=None, sae_name=None):
-    all_acts, all_imgs = get_imnet_acts(model, imnet_dir, layer_name, device, return_imgs=True, sae_weights=sae_weights, batch_size=batch_size)
+def save_top_act_imgs(extractor, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size, sae_weights=None, sae_name=None):
+    all_acts, all_imgs = get_img_acts(extractor, imnet_dir, layer_name, device, return_imgs=True, sae_weights=sae_weights, batch_size=batch_size)
+    print(np.any(np.array(all_acts) != 0, axis=0).nonzero()[0].shape)
+    print(np.any(np.array(all_acts) != 0, axis=0).nonzero()[0][:32])
 
     if save_act_dir is not None:
         Path(save_act_dir).mkdir(parents=True, exist_ok=True)
-        np.save(os.path.join(save_act_dir, f'{layer_name if sae_name is None else sae_name}_valid.npy'), np.array(all_acts))
+        np.save(os.path.join(save_act_dir, f'{layer_name if sae_name is None else sae_name}.npy'), np.array(all_acts))
 
-    save_count = 32
+    save_count = 64
     all_sorted_idx = sort_acts(all_acts, save_count)
     for i in range(len(all_sorted_idx)):
         sorted_idx = all_sorted_idx[i]
@@ -153,10 +155,10 @@ def dnn_align(source_acts, target_acts):
     )
     print(f"Ridge score: {np.array(scores).mean()}")
     results = pairwise_corr(source_acts, target_acts)
-    score = torch.mean(torch.max(results, 1)[0]).cpu().numpy()
+    score = torch.mean(torch.max(results, 0)[0]).cpu().numpy()
     print(f"Pairwise score: {score}")
-    # score = RSA(source_acts, target_acts)[0]
-    # print(score)
+    score = RSA(source_acts, target_acts)[0]
+    print(f'RSA: {score}')
     exit()
 
     # results = pairwise_corr(source_acts, target_acts)
@@ -181,7 +183,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--img_dir', type=str, default='')
     parser.add_argument('--save_img_dir', type=str, default='')
-    parser.add_argument('--save_act_dir', type=str, default='')
+    parser.add_argument('--save_act_dir', type=str, default=None)
     parser.add_argument('--layer_name', type=str, default='')
     parser.add_argument('--sae_name', type=str, default=None)
     parser.add_argument('--sae_weights_dir', type=str, default=None)
@@ -201,14 +203,14 @@ if __name__ == '__main__':
 
     from thingsvision import get_extractor
 
-    model_name = 'resnet50'
-    param_name = {'weights': 'IMAGENET1K_V2'}
+    # model_name = 'resnet50'
+    # param_name = {'weights': 'IMAGENET1K_V2'}
 
     # model_name = 'resnet18'
     # param_name = {'weights': 'IMAGENET1K_V1'}
 
-    # model_name = 'vit_l_16'
-    # param_name = {'weights': 'IMAGENET1K_V1'}
+    model_name = 'vit_b_16'
+    param_name = {'weights': 'IMAGENET1K_V1'}
 
     extractor = get_extractor(
         model_name=model_name,
@@ -217,7 +219,8 @@ if __name__ == '__main__':
         pretrained=True,
         model_parameters=param_name
     )
-    extractor.model.load_state_dict(torch.load('/home/chkapoor/pytorch-cifar/checkpoint_imagenet/resnet50/seed_2/epoch_78.pth')['net'])
+    # extractor.model.load_state_dict(torch.load('/home/chkapoor/pytorch-cifar/checkpoint_imagenet/resnet50/seed_2/epoch_78.pth')['net'])
+    extractor.model.load_state_dict(torch.load('/home/alongon/model_weights/vit_b_16/checkpoint_seed2.pth')['model_state_dict'])
 
     sae_states = None
     save_img_dir = None
@@ -254,21 +257,20 @@ if __name__ == '__main__':
     else:
         save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
     Path(save_act_dir).mkdir(parents=True, exist_ok=True)
+    all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
     # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
- 
     np.save(os.path.join(save_act_dir, f'{args.layer_name}_center_patch_train.npy'), np.array(all_acts))
 
     # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
     # save_top_act_imgs(
-    #     model,
+    #     extractor,
     #     args.img_dir,
     #     args.layer_name,
     #     save_act_dir,
     #     save_img_dir,
     #     device,
     #     args.batch_size,
-    #     sae_weights=sae_weights,
+    #     sae_weights=sae_states,
     #     sae_name=args.sae_name
     # )

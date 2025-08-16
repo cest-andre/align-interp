@@ -113,24 +113,24 @@ class SAE(nn.Module):
             x = torch.zeros_like(preact_feats, device=self.device)
             x.scatter_(-1, topk_res.indices, values)
 
-            # self.stats_last_nonzero *= (x == 0).all(dim=0).long()
-            # self.stats_last_nonzero += 1
+            self.stats_last_nonzero *= (x == 0).all(dim=0).long()
+            self.stats_last_nonzero += 1
 
-            # auxk_acts = self.auxk_mask_fn(preact_feats)
-            # #   TODO: ensure all batch entries have at least auxk nonzero (dead) acts.
-            # #   On second thought, do I even need to check this?  As there are so many latents,
-            # #   and only k can fire each batch, perhaps it's fairly likely that at least 512
-            # #   do not fire for the first epoch.
+            auxk_acts = self.auxk_mask_fn(preact_feats)
+            #   TODO: ensure all batch entries have at least auxk nonzero (dead) acts.
+            #   On second thought, do I even need to check this?  As there are so many latents,
+            #   and only k can fire each batch, perhaps it's fairly likely that at least 512
+            #   do not fire for the first epoch.
             # if (torch.sum(auxk_acts != 0, dim=-1) >= self.auxk).all(dim=0):
-            #     num_dead = torch.mean(torch.sum(auxk_acts != 0, dim=-1).type(torch.float))
-            #     deadk_res = torch.topk(auxk_acts, k=self.auxk, dim=-1)
-            #     top_dead_acts = torch.zeros_like(auxk_acts)
-            #     top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
-            #     top_dead_acts = nn.ReLU()(top_dead_acts)
+            num_dead = torch.mean(torch.sum(auxk_acts != 0, dim=-1).type(torch.float))
+            deadk_res = torch.topk(auxk_acts, k=self.auxk, dim=-1)
+            top_dead_acts = torch.zeros_like(auxk_acts)
+            top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
+            # top_dead_acts = nn.ReLU()(top_dead_acts)
         else:
             x = preact_feats
 
-        return nn.ReLU()(x), preact_feats, num_dead
+        return nn.ReLU()(x), preact_feats, top_dead_acts, num_dead
 
     def vanilla_decode(self, x, mu, std):
         x = x @ self.W_dec + self.b_dec
@@ -170,13 +170,13 @@ class SAE(nn.Module):
         # x, mu, std = LN(x)
         mu = std = None
 
-        latents, preact_feats, num_dead = self.encode(x)
+        latents, preact_feats, top_dead_acts, num_dead = self.encode(x)
         out = self.decode(latents, mu, std)
 
-        # if top_dead_acts is not None:
-        #     dead_acts_recon = self.decode(top_dead_acts, mu, std)
+        if top_dead_acts is not None:
+            dead_acts_recon = self.decode(top_dead_acts, mu, std)
 
-        return latents, out, preact_feats, num_dead
+        return latents, out, preact_feats, dead_acts_recon, num_dead
 
     def train(self, mode=True):
         """
