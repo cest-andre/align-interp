@@ -19,7 +19,7 @@ class SAE(nn.Module):
 
         self.input_dims = input_dims
         self.output_dims = input_dims
-        self.num_latents = input_dims * expansion
+        self.num_latents = int(input_dims * expansion)
         self.dtype = dtype
         self.device = device
         self.topk = topk

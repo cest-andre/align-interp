@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--start_epoch', type=int, default=0)
-    parser.add_argument('--expansion', type=int, default=32)
+    parser.add_argument('--expansion', type=float, default=32)
     parser.add_argument('--topk', type=int, default=0)
     parser.add_argument('--num_input_dims', type=int, default=0)
     parser.add_argument('--archetype_k', type=int, default=0)  # value used in paper = 32000
@@ -33,6 +33,7 @@ if __name__ == "__main__":
 
     acts_data = np.load(args.acts_path)
     acts_data = torch.tensor(acts_data, dtype=torch.float)
+
     if args.relu:
         acts_data = torch.clamp(acts_data, min=0)
 
@@ -61,7 +62,7 @@ if __name__ == "__main__":
     adam_beta1 = 0.9
     adam_beta2 = 0.999
     aux_alpha = 1e-4
-    l1_lambda = 1e-3
+    l1_lambda = 2
     mse_scale = (
         1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
     )
@@ -70,8 +71,8 @@ if __name__ == "__main__":
         num_dims,
         args.expansion,
         topk=args.topk if args.topk > 0 else None,
-        auxk=(num_dims * args.expansion),
-        dead_steps_threshold=64,
+        auxk=int(num_dims * args.expansion),
+        dead_steps_threshold=32,
         device=device,
         enc_data=None,
         archetypes=archetypes
@@ -87,7 +88,10 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_1e-3lambda_{args.expansion}exp'
+    label = f'top{args.topk}_aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_2lambda_{args.expansion}exp'
+    # torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_randinit.pth")
+    # exit()
+
     if args.start_epoch > 0:
         sae.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_sae_weights_{args.start_epoch}ep.pth"))
         optimizer.load_state_dict(torch.load(f"{args.ckpt_dir}/{label}_opt_states_{args.start_epoch}ep.pth"))
@@ -106,8 +110,8 @@ if __name__ == "__main__":
             latents, acts_hat, preact_feats, dead_acts_recon, num_dead = sae(acts)
 
             mse_loss = mse(acts_hat, acts, reduction="none").sum(-1)
-            # weighted_latents = latents * sae.W_dec.norm(dim=1)
-            sparsity = latents.norm(p=1, dim=-1)
+            weighted_latents = latents * sae.W_dec.norm(dim=1)
+            sparsity = weighted_latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
             total_l1 += sparsity.mean().cpu().detach().numpy()
@@ -144,7 +148,7 @@ if __name__ == "__main__":
         print(f"Average L1:  {total_l1 / i}")
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 100 == 0:
+        if (ep+1) % 500 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
             torch.save(optimizer.state_dict(), f"{args.ckpt_dir}/{label}_opt_states_{ep+1}ep.pth")
         
