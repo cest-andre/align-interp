@@ -1,3 +1,4 @@
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import os
 import sys
@@ -5,9 +6,125 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from scipy.stats import sem
+from scipy.io import loadmat
 
 from utils import RSA, SemiMatching, SoftMatching, RidgeRegression, pairwise_corr
+from sae import LN
 from voxel_utils import voxel_dnn_align, extract_coco_ids
+
+
+def face_dprime_histo(acts_dir, vinken_path, savedir):
+    model = 'clip_vit-b-32'
+    layer = 'visual.transformer.resblocks.11'
+    dnn_opt_topk = {'k': 77, 'epoch': 300, 'exp': 2.0}
+    fig, ax = plt.subplots(layout='constrained')
+
+    #   Face labels are:  1 - human faces, 2 - monkey faces, 3 - nonfaces
+    face_labels = np.squeeze(loadmat(vinken_path)['imsets'])
+    # face_labels = face_labels[np.nonzero(face_labels != 2)[0]]
+    face_idx = np.nonzero(face_labels == 2)[0]
+    nonface_idx = np.nonzero(np.logical_or(face_labels == 1, face_labels == 3))[0]
+
+    base_neurons = np.load(os.path.join(acts_dir, model, 'raw_neurons', f'{layer}.npy'))
+    sae_latents = np.load(os.path.join(acts_dir, model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_{dnn_opt_topk["epoch"]}ep.npy'))
+
+    all_acts = [base_neurons, sae_latents]
+    all_dprimes = []
+    for acts in all_acts:
+        # acts = acts[np.concatenate((face_idx, nonface_idx))]
+        dead_indices = np.all(acts == 0, axis=0).nonzero()[0]
+        act_idx = np.delete(np.arange(acts.shape[1]), dead_indices)
+        acts = np.delete(acts, dead_indices, axis=1)
+        acts = acts - acts.mean(axis=0)
+        acts = acts / np.sqrt(np.sum(acts**2, axis=0))
+
+        face_acts = acts[face_idx]
+        face_act_perc = np.sum(face_acts > 0, axis=0) / face_acts.shape[0]
+
+        nonface_acts = acts[nonface_idx]
+        nonface_act_perc = np.sum(nonface_acts > 0, axis=0) / nonface_acts.shape[0]
+
+        dprimes = (np.mean(face_acts, axis=0) - np.mean(nonface_acts, axis=0)) / np.sqrt((np.var(face_acts, axis=0) + np.var(nonface_acts, axis=0)) / 2)
+        print(face_act_perc[np.argsort(dprimes)[-16:]])
+        print(act_idx[np.argsort(dprimes)[-16:]])
+        print('---')
+        all_dprimes.append(dprimes)
+
+    # exit()
+    ax.hist(np.array(all_dprimes[0]), bins=20, color='c', alpha=0.5, label='Base Neurons')
+    ax.hist(np.array(all_dprimes[1]), bins=20, color='m', alpha=0.5, label='SAE Latents')
+
+    face_base_neurons = all_dprimes[0][np.nonzero(all_dprimes[0] > 0)[0]]
+    face_sae_latents = all_dprimes[1][np.nonzero(all_dprimes[1] > 0)[0]]
+    ax.axvline(face_base_neurons.mean(), color='c', linestyle='--')
+    ax.axvline(face_sae_latents.mean(), color='m', linestyle='--')
+    
+    ax.set_xlabel('D Prime')
+    ax.set_ylabel('# Units')
+    ax.set_title('CLIP ViT resblocks.11 Monkey Face Selectivity of Base Neurons vs. SAE Latents')
+    ax.legend(loc='upper right')
+    plt.savefig(os.path.join(savedir, 'clip_vit_resblocks.11_monkey_face_dprime.png'), bbox_inches='tight', dpi=300)
+
+
+#   Perform SAE->voxel linreg alignment.  Obtain learned linreg mapping and investigate:
+#   For each SAE latent, measure the magnitude of its voxel weights.  Rank order latents by their mags,
+#   print out the latent IDs of top K mags, plot histogram of all mags.  My guess is it would be fairly bimodal.
+#   Make sure to factor in IDs and dead latent removal.
+#   NOTE:  if I want to visualize the weights as a voxel population code, I'll have to be mindful of how the voxels
+#          are normalized prior to lin reg.
+#   TODO:  HOW TO HANDLE KFOLDS?
+def dnn_brain_linreg_interp(basedir, savedir, coco_dir, nsd_root, subj_id=1):
+    model = 'resnet50'
+    layer = 'layer4.2'
+    dnn_opt_topk = {'k': 41, 'epoch': 300, 'exp': 2}
+    fig, ax = plt.subplots(layout='constrained')
+
+    source_neurons = torch.tensor(
+        np.load(os.path.join(basedir, 'coco_acts', model, 'raw_neurons', f'{layer}.npy'))
+    )
+    source_sae_acts = torch.tensor(
+        np.load(os.path.join(basedir, 'coco_acts', model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_{dnn_opt_topk["epoch"]}ep.npy'))
+    )
+    voxel_acts = torch.tensor(
+        np.load(os.path.join(nsd_root, 'ventral_visual_data', f'subj{subj_id}.npy'))
+    )
+    # voxel_acts = torch.tensor(
+    #     np.load(os.path.join(basedir, 'nsd', 'ventral_visual', f'subj{subj_id}', '256means_filtered_train_voxels.npy'))
+    # )
+    print(voxel_acts.shape)
+
+    source_acts = [source_sae_acts]
+    all_mags = []
+    for acts in source_acts:
+        _, coeffs, x_rem_indices = voxel_dnn_align(coco_dir, subj_id, nsd_root, acts, voxel_acts, n_splits=2)
+        print(coeffs.shape)
+        
+        mags = []
+        live_mags = []
+        live_idx = 0
+        for i in range(source_neurons.shape[1]):
+            if i in x_rem_indices:
+                mags.append(-1)
+            else:
+                sae_voxel_mag = np.linalg.norm(coeffs[:, live_idx])
+                mags.append(sae_voxel_mag)
+                live_mags.append(sae_voxel_mag)
+                live_idx += 1
+
+        mags = np.array(mags)
+        live_mags = np.array(live_mags)
+        print(np.argsort(mags)[-32:])
+        print(np.argsort(live_mags)[-32:])
+        all_mags.append(live_mags)
+        np.save('/home/alongon/model_weights/voxel_saes/ventral_visual/subj1/resnet50_layer4.2_top41_2exp_300ep_sae_linreg_coeff.npy', coeffs)
+        exit()
+
+    ax.hist(np.array(all_mags[0]), bins=20, color='c', alpha=0.5, label='Base Neurons')
+    ax.hist(np.array(all_mags[1]), bins=20, color='m', alpha=0.5, label='SAE Latents')
+    ax.set_xlabel('DNN-Voxel LinReg Map Magnitude')
+    ax.set_ylabel('# Units')
+    ax.legend(loc='upper right')
+    plt.savefig(os.path.join(savedir, 'resnet50_layer4.2_nsd_ventral_linreg_mags.png'), bbox_inches='tight', dpi=300)
 
 
 def plot_brain_align_hierarchy(nsd_root, sae_acts_root, splits_path, savedir, subj1=1, subj2=2):
@@ -65,7 +182,7 @@ def plot_brain_align_hierarchy(nsd_root, sae_acts_root, splits_path, savedir, su
     plt.savefig(os.path.join(savedir, f'nsd_subj{subj1}-subj{subj2}_rsa.png'), bbox_inches='tight', dpi=300)
 
 
-def plot_dnn_brain_alignment(basedir, savedir, splits_path, nsd_path, coco_dir, nsd_root, subj_id=1):
+def plot_dnn_brain_alignment(basedir, savedir, coco_dir, nsd_root, subj_id=1):
     # # source_model = 'resnet50'
     # # layer = 'layer4.2.bn2'
     # source_model = 'vit_b_16'
@@ -77,8 +194,8 @@ def plot_dnn_brain_alignment(basedir, savedir, splits_path, nsd_path, coco_dir, 
     noise_ceiling = 1
 
     models = ['resnet50', 'vit_b_16']
-    layers = ['layer4.2', 'encoder.layers.encoder_layer_11']
-    dnn_opt_topk_list = [{'k': 82, 'epoch': 300, 'exp': 4}, {'k': 64, 'epoch': 300, 'exp': 4}]
+    layers = ['layer4.2.bn2', 'encoder.layers.encoder_layer_11']
+    dnn_opt_topk_list = [{'k': 102, 'epoch': 300, 'exp': 2}, {'k': 64, 'epoch': 300, 'exp': 4}]
     width = 0.25
     fig, ax = plt.subplots(layout='constrained')
     x_labels = ()
@@ -97,7 +214,7 @@ def plot_dnn_brain_alignment(basedir, savedir, splits_path, nsd_path, coco_dir, 
         #     np.load(os.path.join(basedir, f'nsd/subj{subj_id}', f'train_voxels.npy'))
         # )
         voxel_acts = torch.tensor(
-            np.load(os.path.join(nsd_root, f'subj{subj_id}.npy'))
+            np.load(os.path.join(nsd_root, 'ffa_data', f'subj{subj_id}.npy'))
         )
         source_sae_acts = torch.tensor(
             np.load(os.path.join(basedir, 'coco_acts', model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_{dnn_opt_topk["epoch"]}ep.npy'))
@@ -105,30 +222,30 @@ def plot_dnn_brain_alignment(basedir, savedir, splits_path, nsd_path, coco_dir, 
         # voxel_sae_acts = torch.tensor(
         #     np.load(os.path.join(basedir, 'nsd/subj1/voxel_sae_acts', f'top{voxel_opt_topk["k"]}_aux_2exp_sae_weights_{voxel_opt_topk["epoch"]}ep.npy'))
         # )
-        source_rand_sae_acts = torch.tensor(
-            np.load(os.path.join(basedir, 'coco_acts', model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_randinit.npy'))
-        )
+        # source_rand_sae_acts = torch.tensor(
+        #     np.load(os.path.join(basedir, 'coco_acts', model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_randinit.npy'))
+        # )
 
-        base_scores = voxel_dnn_align(splits_path, nsd_path, coco_dir, subj_id, nsd_root, source_neurons, voxel_acts) / noise_ceiling
-        base_score = base_scores.mean()
+        base_scores, _, _ = voxel_dnn_align(coco_dir, subj_id, nsd_root, source_neurons, voxel_acts)
+        base_score = base_scores.mean() / noise_ceiling
         base_error = sem(base_scores)
 
-        sae_base_scores = voxel_dnn_align(splits_path, nsd_path, coco_dir, subj_id, nsd_root, source_sae_acts, voxel_acts) / noise_ceiling
-        sae_base_score = sae_base_scores.mean()
+        sae_base_scores, _, _ = voxel_dnn_align(coco_dir, subj_id, nsd_root, source_sae_acts, voxel_acts)
+        sae_base_score = sae_base_scores.mean() / noise_ceiling
         sae_base_error = sem(sae_base_scores)
 
-        # sae_sae_scores = voxel_dnn_align(splits_path, nsd_path, coco_dir, subj_id, source_sae_acts, voxel_sae_acts) / noise_ceiling
+        # sae_sae_scores = voxel_dnn_align(coco_dir, subj_id, source_sae_acts, voxel_sae_acts) / noise_ceiling
         # sae_sae_score = sae_sae_scores.mean()
         # sae_sae_error = sem(sae_sae_scores)
 
-        rand_sae_scores = voxel_dnn_align(splits_path, nsd_path, coco_dir, subj_id, nsd_root, source_rand_sae_acts, voxel_acts) / noise_ceiling
-        rand_sae_score = rand_sae_scores.mean()
-        rand_sae_error = sem(rand_sae_scores)
+        # rand_sae_scores = voxel_dnn_align(coco_dir, subj_id, nsd_root, source_rand_sae_acts, voxel_acts) / noise_ceiling
+        # rand_sae_score = rand_sae_scores.mean()
+        # rand_sae_error = sem(rand_sae_scores)
         
         ax.bar(i, base_score, width, yerr=base_error, color='c', label=legend_labels[0])
         bar = ax.bar(i + width, sae_base_score, width, yerr=sae_base_error, color='m', label=legend_labels[1])
         # ax.bar(2*width, sae_sae_score, width, yerr=sae_sae_error, color='y', label=legend_labels[2])
-        ax.bar(i + (2*width), rand_sae_score, width, yerr=rand_sae_error, color='0.4', label=legend_labels[4])
+        # ax.bar(i + (2*width), rand_sae_score, width, yerr=rand_sae_error, color='0.4', label=legend_labels[4])
 
         ax.bar_label(bar, labels=['{:+0.2f}%'.format(((sae_base_score / base_score) - 1) * 100)], padding=3)
 
@@ -136,19 +253,19 @@ def plot_dnn_brain_alignment(basedir, savedir, splits_path, nsd_path, coco_dir, 
             legend_labels = [None, None, None, None, None]
 
     # ax.set_ylabel('Noise-normalized Ridge Pearson r')
-    # ax.set_ylabel('Pairwise Mean Similarity')
-    ax.set_ylabel('RSA (Pearson r)')
+    ax.set_ylabel('Pairwise Mean Similarity')
+    # ax.set_ylabel('RSA (Pearson r)')
     # ax.set_ylabel('Soft Match Corr')
     # ax.set_ylabel('NNLS Pearson r')
-    ax.set_title(f'DNN->NSD Subject {subj_id} hV4 Voxel Alignment')
+    ax.set_title(f'DNN->NSD Subject {subj_id} FFA Voxel Alignment')
     ax.set_xticks(np.arange(len(models)) + (1*width), x_labels)
     ax.legend(loc='upper left', ncols=3)
     ax.set_ylim(0, 1)
 
-    plt.savefig(os.path.join(savedir, f'dnn-nsd_subj{subj_id}_hV4_rsa.png'), bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join(savedir, f'dnn-nsd_subj{subj_id}_ffa_pairwise.png'), bbox_inches='tight', dpi=300)
 
 
-def plot_dnn_seed_alignment(basedir, savedir):
+def plot_dnn_alignment(basedir, savedir):
     source_model = 'vit_b_16_seed1'
     target_model = 'vit_b_16_seed2'
     layers = ['encoder.layers.encoder_layer_5.mlp', 'encoder.layers.encoder_layer_11.mlp']
@@ -230,6 +347,107 @@ def plot_dnn_seed_alignment(basedir, savedir):
     ax.set_ylim(0, 1)
 
     plt.savefig(os.path.join(savedir, f'{source_model}-{target_model}_mlp.5-mlp.11_ridge.png'), bbox_inches='tight', dpi=300)
+
+
+def plot_dnn_alignment_grid(act_root, nsd_root, coco_dir, savedir):
+    models = ['resnet50', 'vit_b_16', 'clip_vit-b-32']
+    layers = ['layer4.2', 'encoder.layers.encoder_layer_11', 'visual.transformer.resblocks.11']
+    opt_topk = [
+        {'k': 41, 'epoch': '300ep', 'exp': 2},
+        {'k': 153, 'epoch': '300ep', 'exp': 2},
+        {'k': 153, 'epoch': '300ep', 'exp': 2.0}
+    ]
+    opt_vanilla = [
+        {'lambda': '1e-2', 'epoch': '300ep', 'exp': 4.0},
+        {'lambda': '1e-2', 'epoch': '300ep', 'exp': 4.0},
+        {'lambda': '1e-2', 'epoch': '300ep', 'exp': 4.0}
+    ]
+    uses_topk = [False, False, False]
+
+    subj1_coco_ids = np.load(os.path.join(nsd_root, f'subj1_coco_IDs.npy'))
+    all_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
+    subj1_coco_ids = [all_ids.index(str(id)) for id in subj1_coco_ids]
+
+    base_results = []
+    sae_results = []
+    results = []
+    for i in range(len(models)):
+        source_model = models[i]
+        source_layer = layers[i]
+
+        source_neurons = torch.tensor(
+            np.load(os.path.join(act_root, source_model, 'raw_neurons', f'{source_layer}.npy'))[subj1_coco_ids]
+        )
+        source_latents = torch.tensor(
+            np.load(
+                os.path.join(act_root, source_model, 'sae_latents', source_layer,
+                f'top{opt_topk[i]["k"]}_aux_{opt_topk[i]["exp"]}exp_sae_weights_{opt_topk[i]["epoch"]}.npy' if uses_topk[i]
+                else f'vanilla_{opt_vanilla[i]["lambda"]}lambda_{opt_vanilla[i]["exp"]}exp_sae_weights_{opt_vanilla[i]["epoch"]}.npy')
+            )[subj1_coco_ids]
+        )
+
+        for j in range(len(models)):
+            if i == j:
+                results.append(0)
+                base_results.append(1)
+                sae_results.append(1)
+                continue
+
+            target_model = models[j]
+            target_layer = layers[j]
+
+            target_neurons = torch.tensor(
+                np.load(os.path.join(act_root, target_model, 'raw_neurons', f'{target_layer}.npy'))[subj1_coco_ids]
+            )
+            target_latents = torch.tensor(
+                np.load(
+                    os.path.join(act_root, target_model, 'sae_latents', target_layer,
+                    f'top{opt_topk[j]["k"]}_aux_{opt_topk[j]["exp"]}exp_sae_weights_{opt_topk[j]["epoch"]}.npy' if uses_topk[j]
+                    else f'vanilla_{opt_vanilla[j]["lambda"]}lambda_{opt_vanilla[j]["exp"]}exp_sae_weights_{opt_vanilla[j]["epoch"]}.npy')
+                )[subj1_coco_ids]
+            )
+            
+            # base_score = np.array(RSA(source_neurons, target_neurons))
+            base_score, base_ve, base_mse = RidgeRegression(source_neurons.numpy().astype(np.float64), target_neurons.numpy().astype(np.float64))
+            base_score, base_ve, base_mse = np.array(base_score).mean(), np.array(base_ve).mean(), np.array(base_mse).mean()
+            base_results.append(base_mse)
+
+            # sae_score = np.array(RSA(source_latents, target_latents))
+            sae_score, sae_ve, sae_mse = RidgeRegression(source_latents.numpy().astype(np.float64), target_neurons.numpy().astype(np.float64))
+            sae_score, sae_ve, sae_mse = np.array(sae_score).mean(), np.array(sae_ve).mean(), np.array(sae_mse).mean()
+            sae_results.append(sae_mse)
+
+            if base_score < 0 and sae_score > 0:
+                result = 200
+            else:
+                result = ((sae_score / base_score) - 1)*100
+
+            results.append(result)
+            print(f'{source_model}->{target_model}:\nSAE={sae_score},\nBase Neuron={base_score}\nResult={((sae_score / base_score) - 1)*100}\n')
+
+    base_results = np.reshape(np.array(base_results), (len(models), len(models)))
+    sae_results = np.reshape(np.array(sae_results), (len(models), len(models)))
+    results = np.reshape(np.array(results), (len(models), len(models)))
+    viridis = mpl.colormaps['viridis'].resampled(256)
+    fig, ax = plt.subplots(1, 1, figsize=(4, 3), layout='constrained', squeeze=False)
+    psm = ax[0, 0].pcolor(results, cmap=viridis, rasterized=True, vmin=-200, vmax=200)
+    fig.colorbar(psm, ax=ax)
+
+    for i in range(results.shape[0]):
+        for j in range(results.shape[1]):
+            # Position text at the center of each cell
+            ax[0, 0].text(
+                j + 0.5, i + 0.5, f'{results[i, j]:.2f}%', 
+                ha='center', va='center', color='black', fontsize=6
+            )
+
+    ax[0, 0].set_xticks(np.arange(results.shape[0]) + (1/2), models, size=7)
+    # ax[0, 0].set_xlabel('Feature 2 Corr', size=9)
+    ax[0, 0].set_yticks(np.arange(results.shape[0]) + (1/2), models, size=7)
+    # ax[0, 0].set_ylabel('Feature 1 Corr', size=9)
+    ax[0, 0].set_title('Cross-Model Ridge SAE->Neuron % Relative to Neuron->Neuron', size=10)
+
+    plt.savefig(os.path.join(savedir, f'dnn_rsa_grid.png'), bbox_inches='tight', dpi=300)
 
 
 def plot_toy_alignments(basedir):
@@ -362,6 +580,59 @@ def plot_toy_weight_histos(basedir):
     plt.savefig('/home/alongon/figures/superposition_alignment/toy_model_powerlaw_final_overlap_histos.png', bbox_inches='tight', dpi=300)
 
 
+def plot_toy_sae_val_hist(basedir):
+    seeds = [0, 1]
+    num_feats = 64
+    neurons = [8, 16, 32]
+
+    train_split = 0.8
+    feature_data = torch.tensor(
+        np.load(os.path.join(basedir, f'{num_feats}feats_dataset.npy'))
+    )
+    feature_data = feature_data[-int(feature_data.shape[0]*(1-train_split)):]
+
+    #   One histogram per toy model size?  That would be two models' neuron acts and SAE latents, so 4 separate acts total.
+    #   Maybe best to split up per-model, but still plot neurons and SAE latents on same fig.
+    fig, axs = plt.subplots(len(neurons), 2, sharey='row', layout='constrained')
+    for i in range(len(neurons)):
+        for j in range(len(seeds)):
+            neuron_acts = torch.tensor(
+                np.load(os.path.join(basedir, f'{num_feats}feats_{neurons[i]}neurons_powerlaw_final', f'model{seeds[j]}_raw_neuron_acts.npy'))
+            )[-feature_data.shape[0]:]
+            sae_acts = torch.tensor(
+                np.load(os.path.join(basedir, f'{num_feats}feats_{neurons[i]}neurons_powerlaw_final', f'model{seeds[j]}_top7_sae_acts.npy'))
+            )
+
+            neuron_results = pairwise_corr(neuron_acts, feature_data).numpy()
+            neuron_results = np.max(neuron_results, axis=0)
+            sae_results = pairwise_corr(sae_acts, feature_data).numpy()
+            sae_results = np.max(sae_results, axis=0)
+
+            _, _, neuron_patches = axs[i, j].hist(neuron_results, bins=20, range=(0,1), color='c', alpha=0.5)
+            _, _, sae_patches = axs[i, j].hist(sae_results, bins=20, range=(0,1), color='m', alpha=0.5)
+
+            axs[i, j].axvline(neuron_results.mean(), color='c', linestyle='--')
+            axs[i, j].axvline(sae_results.mean(), color='m', linestyle='--')
+            axs[i, j].set_xlim(0, 1)
+
+            if i == 0 and j == 0:
+                neuron_patches.set_label('Base Neurons')
+                sae_patches.set_label('SAE Latents')
+
+                axs[i, j].legend(loc='upper right')
+            elif j == 1:
+                axs[i, j].set_ylabel(f'N={neurons[i]}                ', fontsize=12, rotation='horizontal')
+
+        if i == 0:
+            axs[i, 0].set_title('Seed 1', fontsize=10)
+            axs[i, 1].set_title('Seed 2', fontsize=10)
+        elif i == len(neurons)-1:
+            axs[i, 0].set_xlabel('Max Pearson r', fontsize=10)
+            axs[i, 0].set_ylabel('# of Features', fontsize=10)
+
+    plt.savefig('/home/alongon/figures/superposition_alignment/toy_model_sae_validate.png', bbox_inches='tight', dpi=300)
+
+
 def plot_ds_size(source_neurons, source_latents, target_neurons):
     width = 0.25
     fig, ax = plt.subplots(layout='constrained')
@@ -404,28 +675,72 @@ def plot_ds_size(source_neurons, source_latents, target_neurons):
     plt.savefig('/home/alongon/figures/superposition_alignment/dataset_size_align.png', bbox_inches='tight', dpi=300)
 
 
+def plot_convergence_grid(grid_path):
+    grid_results = np.load(grid_path)
+
+    viridis = mpl.colormaps['viridis'].resampled(256)
+    n = 1
+
+    fig, ax = plt.subplots(1, n, figsize=(n * 2 + 2, 3), layout='constrained', squeeze=False)
+    psm = ax[0, 0].pcolor(grid_results, cmap=viridis, rasterized=True, vmin=0, vmax=1)
+    fig.colorbar(psm, ax=ax)
+
+    ax[0, 0].set_xticks(np.arange(grid_results.shape[0]) + (1/2), np.arange(-1, 1.25, 0.25), size=7)
+    ax[0, 0].set_xlabel('Feature 2 Corr', size=9)
+    ax[0, 0].set_yticks(np.arange(grid_results.shape[0]) + (1/2), np.arange(-1, 1.25, 0.25), size=7)
+    ax[0, 0].set_ylabel('Feature 1 Corr', size=9)
+    ax[0, 0].set_title('Superposition Arrangement Consistency\nCross-Model Mean Pairwise Corr', size=12)
+
+    plt.savefig('/home/alongon/data/toy_arrange_converge/3feats_2neurons/converge_results.png', bbox_inches='tight', dpi=300)
+
+
 if __name__ == '__main__':
-    plot_brain_align_hierarchy(
-        '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/',
-        '/home/alongon/data/nsd',
-        '/mnt/cogsci/NSD_preprocessed_datasets_shreya/ventral_visual_data/ventral_visual_data_splits_1257.pickle',
-        '/home/alongon/figures/superposition_alignment',
-        subj1=1, subj2=2
+    face_dprime_histo(
+        '/home/alongon/data/vinken_acts',
+        '/home/alongon/data/vinken_face_cells/data/images.mat',
+        '/home/alongon/figures/misc'
     )
+
+    # dnn_brain_linreg_interp(
+    #     '/home/alongon/data',
+    #     '/home/alongon/figures/superposition_alignment',
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/images/',
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/',
+    #     subj_id=1
+    # )
+
+    # plot_toy_sae_val_hist('/home/alongon/data/toy_align')
+
+    # plot_dnn_alignment_grid(
+    #     '/home/alongon/data/coco_acts',
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/ventral_visual_data',
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/images/',
+    #     '/home/alongon/figures/superposition_alignment'
+    # )
+
+    # plot_convergence_grid(
+    #     '/home/alongon/data/toy_arrange_converge/3feats_2neurons/convergence_results_grid.npy'
+    # )
+
+    # plot_brain_align_hierarchy(
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/',
+    #     '/home/alongon/data/nsd',
+    #     '/mnt/cogsci/NSD_preprocessed_datasets_shreya/ventral_visual_data/ventral_visual_data_splits_1257.pickle',
+    #     '/home/alongon/figures/superposition_alignment',
+    #     subj1=1, subj2=2
+    # )
 
     # nsd_subj_ids = [1,2,5,7]
     # for sub_id in nsd_subj_ids:
     # plot_dnn_brain_alignment(
     #     '/home/alongon/data',
     #     '/home/alongon/figures/superposition_alignment',
-    #     '/mnt/cogsci/NSD_preprocessed_datasets_shreya/ventral_visual_data/ventral_visual_data_splits_1257.pickle',
-    #     '/mnt/cogsci/NSD_preprocessed_datasets_shreya/ventral_visual_data/ventral_visual_data_1257_filtered.pickle',
     #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/images/',
-    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed/ventral_visual_data',
+    #     '/mnt/cogsci/KhoslaLab/NSD_Preprocessed',
     #     subj_id=1
     # )
 
-    # plot_dnn_seed_alignment('/home/alongon/data/imagenet_acts', '/home/alongon/figures/superposition_alignment')
+    # plot_dnn_alignment('/home/alongon/data/imagenet_acts', '/home/alongon/figures/superposition_alignment')
 
     # plot_toy_alignments('/home/alongon/data/toy_data')
 

@@ -6,6 +6,7 @@ import torch
 from torchvision import transforms, utils
 # import nimfa
 from scipy.stats import kendalltau, pearsonr
+from scipy.io import loadmat
 import ot
 from sklearn.model_selection import KFold
 from sklearn.linear_model import RidgeCV
@@ -20,12 +21,16 @@ from sae import LN
 #     return results.basis()
 
 
-def sort_acts(all_acts, save_count):
+def sort_acts(all_acts, save_count, save_idx=None):
     idx = np.arange(len(all_acts)).tolist()
     all_acts = np.transpose(np.array(all_acts))
 
+    acts_iter = range(save_count)
+    if save_idx is not None:
+        acts_iter = save_idx
+
     all_sorted_idx = []
-    for i in range(save_count):
+    for i in acts_iter:
         act = all_acts[i]
         _, sorted_idx = zip(*sorted(zip(act.tolist(), idx), reverse=True))
         sorted_idx = np.array(sorted_idx)
@@ -40,7 +45,7 @@ def save_top_imgs(top_imgs, savedir, unit_id, bot_imgs=None):
 
     grid = utils.make_grid(top_imgs, nrow=3)
     grid = transforms.ToPILImage()(grid)
-    grid.save(os.path.join(grids_path, f"{unit_id}.png"))
+    grid.save(os.path.join(grids_path, f"{unit_id}_vinken.png"))
 
     if bot_imgs is not None:
         bot_grids_path = os.path.join(path, "bot_grids")
@@ -84,19 +89,16 @@ def save_top_cocos(coco_dir, coco_ids, unit_id, savedir, bot_ids=None):
     save_top_imgs(top_imgs, savedir, unit_id, bot_imgs)
 
 
+def load_vinken_imgs(img_dir):
+    imgs = loadmat(img_dir)['imarray']
+    imgs = np.transpose(imgs / 255, (3, 2, 0, 1))
+    imgs = torch.tensor(imgs, dtype=torch.float)
+
+    return imgs
+
+
 #   x and y are torch tensors with shape: (num_data, num_units).  Pairwise corrs obtained between all units.
 def pairwise_corr(x, y):
-    # x = torch.clamp(x, min=0)
-    # y = torch.clamp(y, min=0)
-
-    #   Measure sparseness (percent 0) to see if that's what's driving higher corr with SAE latents.
-    # print(torch.nonzero(torch.flatten(x) > 0).shape[0] / (x.shape[0] * x.shape[1]))
-    # print(torch.nonzero(torch.flatten(y) > 0).shape[0] / (y.shape[0] * y.shape[1]))
-    print(f'Num dead source: {torch.all(x == 0, dim=0).nonzero().shape[0]}')
-    print(f'Num dead target: {torch.all(y == 0, dim=0).nonzero().shape[0]}')
-    x = x[:, torch.any(x != 0, dim=0).nonzero()[:, 0]]
-    y = y[:, torch.any(y != 0, dim=0).nonzero()[:, 0]]
-
     x_cent = x - torch.mean(x, 0)
     x_ss = torch.sum(torch.pow(x_cent, 2), 0)
 
@@ -161,6 +163,15 @@ def RSA(X, Y):
     return pearsonr(y_coef[triu_idx], x_coef[triu_idx]).statistic
 
 
+def var_explained(Y, Y_pred):
+    E = Y_pred - Y
+    SS_res = torch.sum(E**2)
+    SS_tot = torch.sum(Y**2)
+    R2 = 1 - SS_res / SS_tot
+
+    return R2.cpu().numpy()
+
+
 def cdist(X,Y):
     cross_term = np.dot(X.T, Y)
     dist_matrix = 1 - cross_term
@@ -182,24 +193,14 @@ def remove_dead_units(X, Y, kf):
 
     X, Y = np.delete(X, x_rem_indices, axis=1), np.delete(Y, y_rem_indices, axis=1)
     
-    return X, Y
-
-
-# def remove_dead_units(train_acts, test_acts):
-#     rem_indices = np.array([], dtype=np.int32)
-#     rem_indices = np.unique(np.concatenate((rem_indices, np.all(train_acts == 0, axis=0).nonzero()[0])))
-#     rem_indices = np.unique(np.concatenate((rem_indices, np.all(test_acts == 0, axis=0).nonzero()[0])))
-
-#     train_acts, test_acts = np.delete(train_acts, rem_indices, axis=1), np.delete(test_acts, rem_indices, axis=1)
-
-#     return train_acts, test_acts
+    return X, Y, x_rem_indices
 
 
 def SemiMatching(X, Y):
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     print('BEFORE DEAD REMOVAL')
     print(X.shape)
-    X, Y = remove_dead_units(X, Y, kf)
+    X, Y, _ = remove_dead_units(X, Y, kf)
     print('AFTER DEAD REMOVAL')
     print(X.shape)
     print('\n')
@@ -230,19 +231,11 @@ def SemiMatching(X, Y):
 
 def SoftMatching(X, Y, itermax=1000):
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    print('BEFORE DEAD REMOVAL')
-    print(X.shape)
-    X, Y = remove_dead_units(X, Y, kf)
-    print('AFTER DEAD REMOVAL')
-    print(X.shape)
-    print('\n')
 
     scores = []
     for i, (train_idx, test_idx) in enumerate(kf.split(X)):
         x_train, x_test = X[train_idx], X[test_idx]
-        # x_train, x_test = remove_dead_units(x_train, x_test)
         y_train, y_test = Y[train_idx], Y[test_idx]
-        # y_train, y_test = remove_dead_units(y_train, y_test)
 
         x_train = x_train - x_train.mean(axis=0)
         x_train = x_train / np.sqrt(np.sum(x_train**2, axis=0))
@@ -275,42 +268,63 @@ def SoftMatching(X, Y, itermax=1000):
     return scores
 
 
-def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17):
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     print('BEFORE DEAD REMOVAL')
     print(X.shape)
-    X, Y = remove_dead_units(X, Y, kf)
+    print(Y.shape)
+    X, Y, x_rem_indices = remove_dead_units(X, Y, kf)
     print('AFTER DEAD REMOVAL')
     print(X.shape)
+    print(Y.shape)
     print('\n')
+    X, _, _ = LN(torch.tensor(X))
+    X = X.numpy()
+    Y, _, _ = LN(torch.tensor(Y))
+    Y = Y.numpy()
 
     scores = []
+    var_exps = []
+    mses = []
+    all_coeffs = []
     for i, (train_idx, test_idx) in enumerate(kf.split(X)):
         x_train, x_test = X[train_idx], X[test_idx]
         y_train, y_test = Y[train_idx], Y[test_idx]
 
-        x_train = x_train - x_train.mean(axis=0)
-        # x_train = x_train / np.sqrt(np.sum(x_train**2, axis=0))
-        y_train = y_train - y_train.mean(axis=0)
-        # y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
+        # x_train = x_train - x_train.mean(axis=0)
+        # # x_train = x_train / np.sqrt(np.sum(x_train**2, axis=0))
+        # y_train = y_train - y_train.mean(axis=0)
+        # # y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
+
+        # x_train, _, _ = LN(torch.tensor(x_train))
+        # x_train = x_train.numpy()
+        # y_train, _, _ = LN(torch.tensor(y_train))
+        # y_train = y_train.numpy()
 
         predictor = RidgeCV(alphas=np.logspace(alpha_min, alpha_max, num_alpha), fit_intercept=False)
         predictor.fit(x_train, y_train)
+
+        all_coeffs.append(predictor.coef_)
 
         # y_pred = predictor.predict(x_train)
         # y_pred = y_pred / np.sqrt(np.sum(y_pred**2, axis=0))
         # y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
         # sim_matrix = 1 - cdist(y_train, y_pred)
         
-        x_test = x_test - x_test.mean(axis=0)
+        # x_test = x_test - x_test.mean(axis=0)
         # x_test = x_test / np.sqrt(np.sum(x_test**2, axis=0))
-        y_test = y_test - y_test.mean(axis=0)
+        # y_test = y_test - y_test.mean(axis=0)
         # y_test = y_test / np.sqrt(np.sum(y_test**2, axis=0))
 
         y_pred = predictor.predict(x_test)
+        mse = np.mean(np.sum((y_pred - y_test)**2, axis=1))
+        mses.append(mse)
+
         y_pred = y_pred / np.sqrt(np.sum(y_pred**2, axis=0))
         y_test = y_test / np.sqrt(np.sum(y_test**2, axis=0))
         sim_matrix = 1 - cdist(y_test, y_pred)
         scores.append(np.mean(np.diag(sim_matrix)))
 
-    return scores
+        var_exps.append(var_explained(torch.tensor(y_test), torch.tensor(y_pred)))
+
+    return scores, all_coeffs, x_rem_indices#, var_exps, mses

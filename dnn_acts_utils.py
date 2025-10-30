@@ -12,7 +12,7 @@ sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'representation-align
 from src.alignment.linear import Linear
 
 from sae import LN
-from utils import sort_acts, save_top_imgs, get_coco_imgs, pairwise_corr, RSA
+from utils import sort_acts, save_top_imgs, get_coco_imgs, pairwise_corr, RSA, load_vinken_imgs
 from monkey_utils import get_mm_imgs
 
 
@@ -54,8 +54,9 @@ def get_vit_acts(extractor, x, module_name, use_cls_token=False):
 
     if use_cls_token:
         acts = acts[:, 0]
-    else:  #  use center image token patch
-        acts = acts[:, (acts.shape[1]-1) // 2, :]
+    else:  
+        # acts = acts[:, (acts.shape[1]-1) // 2, :]  #  use center image token patch
+        acts = np.mean(acts, axis=1)
 
     return acts
 
@@ -81,6 +82,9 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
     elif 'ManyMonkeys' in img_dir:  #  is ManyMonkeys
         imgs = get_mm_imgs(img_dir, transform=load_transform)
         img_ds = TensorDataset(torch.stack(imgs))
+    elif 'vinken' in img_dir:  #  is Vinken Face Cells
+        imgs = load_vinken_imgs(img_dir)
+        img_ds = TensorDataset(imgs)
 
     dataloader = DataLoader(img_ds, num_workers=1, batch_size=batch_size, shuffle=False, drop_last=False)
     all_acts = []
@@ -95,8 +99,8 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
 
         inputs = norm_transform(inputs.to(device))
 
-        if 'vit' in extractor.model_name:
-            acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=True)
+        if 'vit' in extractor.model_name or 'clip' in extractor.model_name:
+            acts = get_vit_acts(extractor, inputs, layer_name, use_cls_token=extractor.model_name != 'clip')
             acts = torch.tensor(acts, device=device)
         else:
             acts = get_cnn_acts(extractor, inputs, layer_name, use_center=True)
@@ -116,7 +120,7 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
                 acts = sae_weights['bn'](acts)
 
             #   topk activation SAE
-            topk_res = torch.topk(acts, k=410, dim=-1)
+            topk_res = torch.topk(acts, k=77, dim=-1)
             values = torch.nn.ReLU()(topk_res.values)
             acts = torch.zeros_like(acts, device=acts.device)
             acts.scatter_(-1, topk_res.indices, values)
@@ -139,7 +143,8 @@ def save_top_act_imgs(extractor, imnet_dir, layer_name, save_act_dir, save_img_d
         np.save(os.path.join(save_act_dir, f'{layer_name if sae_name is None else sae_name}.npy'), np.array(all_acts))
 
     save_count = 64
-    all_sorted_idx = sort_acts(all_acts, save_count)
+    # save_idx = [634, 1463,  200, 1284,  947,  753,  337,  201,  367,  500, 1313,  762,  869,  638,  855, 874]
+    all_sorted_idx = sort_acts(all_acts, save_count, save_idx=None)
     for i in range(len(all_sorted_idx)):
         sorted_idx = all_sorted_idx[i]
         save_top_imgs(all_imgs[sorted_idx[:9]], save_img_dir, i)
@@ -186,33 +191,31 @@ if __name__ == '__main__':
     parser.add_argument('--sae_name', type=str, default=None)
     parser.add_argument('--sae_weights_dir', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=2048)
-    parser.add_argument('--source_acts_path', type=str, default='')
-    parser.add_argument('--target_acts_path', type=str, default='')
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
-    device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
-    
-    if len(args.source_acts_path) > 0:
-        source_acts = torch.clamp(torch.tensor(np.load(args.source_acts_path)), min=0, max=None)
-        target_acts = torch.clamp(torch.tensor(np.load(args.target_acts_path)), min=0, max=None)
-        dnn_align(source_acts, target_acts)
-        exit()
+    device = f"cuda:{args.device}" if torch.cuda.is_available() and args.device is not None else "cpu"
 
     from thingsvision import get_extractor
 
-    model_name = 'resnet50'
-    param_name = {'weights': 'IMAGENET1K_V2'}
+    # model_name = 'resnet50'
+    # param_name = {'weights': 'IMAGENET1K_V2'}
+    # source = 'torchvision'
 
     # model_name = 'resnet18'
     # param_name = {'weights': 'IMAGENET1K_V1'}
 
     # model_name = 'vit_b_16'
     # param_name = {'weights': 'IMAGENET1K_V1'}
+    # source = 'torchvision'
+
+    model_name = 'clip'
+    param_name = {'variant': 'ViT-B/32'}
+    source = 'custom'
 
     extractor = get_extractor(
         model_name=model_name,
-        source='torchvision',
+        source=source,
         device=device,
         pretrained=True,
         model_parameters=param_name
@@ -260,19 +263,19 @@ if __name__ == '__main__':
         if args.save_img_dir is not None:
             save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
-    # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
-    np.save(os.path.join(save_act_dir, f'{args.layer_name}_center_patch_train.npy'), np.array(all_acts))
+    # all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
+    # # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
+    # np.save(os.path.join(save_act_dir, f'{args.layer_name}_train.npy'), np.array(all_acts))
 
-    # Path(save_img_dir).mkdir(parents=True, exist_ok=True)
-    # save_top_act_imgs(
-    #     extractor,
-    #     args.img_dir,
-    #     args.layer_name,
-    #     save_act_dir,
-    #     save_img_dir,
-    #     device,
-    #     args.batch_size,
-    #     sae_weights=sae_states,
-    #     sae_name=args.sae_name
-    # )
+    Path(save_img_dir).mkdir(parents=True, exist_ok=True)
+    save_top_act_imgs(
+        extractor,
+        args.img_dir,
+        args.layer_name,
+        save_act_dir,
+        save_img_dir,
+        device,
+        args.batch_size,
+        sae_weights=sae_states,
+        sae_name=args.sae_name
+    )

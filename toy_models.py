@@ -22,7 +22,8 @@ class Model(nn.Module):
         n_hidden,
         device,
         feature_probability = None,
-        importance = None
+        importance = None,
+        feature_corrs = None
     ):
         super().__init__()
         self.n_features = n_features
@@ -31,14 +32,19 @@ class Model(nn.Module):
         nn.init.xavier_normal_(self.W)
         self.b_final = nn.Parameter(torch.zeros((n_features), device=device))
 
+        self.device = device
+
         if feature_probability is None:
             feature_probability = torch.ones(()) * 0.1
         self.feature_probability = feature_probability.to(device)
         if importance is None:
             #   NOTE: change importance to be a simple powerlaw of x^-2, sampled 64 times uniformly from 1 to 3 (importance=1 to 0.1)
-            # importance = torch.ones(())
-            importance = torch.pow(torch.arange(1, 3, (2 / self.n_features)), -2)
+            importance = torch.ones(())
+            # importance = torch.pow(torch.arange(1, 3, (2 / self.n_features)), -2)
         self.importance = importance.to(device)
+        self.feature_corrs = feature_corrs
+        self.generate_batch = self.generate_align_batch if self.feature_corrs is None else self.generate_corr_batch
+
 
     def forward(self, features):
         # features: [..., instance, n_features]
@@ -48,15 +54,59 @@ class Model(nn.Module):
         out = hidden @ self.W.T #torch.einsum("...ih,ifh->...if", hidden, self.W)
         out = out + self.b_final
         out = F.relu(out)
-        return out, hidden
 
-    def generate_batch(self, n_batch):
+        return {"out": out, "hidden": hidden}
+
+
+    def generate_align_batch(self, n_batch):
         feat = torch.rand((n_batch, self.n_features), device=self.W.device)
         batch = torch.where(
             torch.rand((n_batch, self.n_features), device=self.W.device) <= self.feature_probability,
             feat,
-            torch.zeros((), device=self.W.device),
+            torch.zeros((), device=self.W.device)
+        )     
+
+        return batch
+
+
+    def generate_corr_batch(self, n_batch):
+        ind_feat = torch.where(
+            torch.rand(n_batch, device=self.W.device) <= self.feature_probability,
+            torch.rand(n_batch, device=self.W.device),
+            torch.zeros((), device=self.W.device)
         )
+        corr_feats = []
+        for corr in self.feature_corrs:
+            corr_sample = torch.rand(n_batch, device=self.W.device)
+            if corr > 0:
+                corr_feat = torch.where(
+                    torch.logical_or(
+                        torch.logical_and((corr_sample <= corr), (ind_feat != 0)),
+                        corr_sample <= self.feature_probability-(self.feature_probability*corr)
+                    ),
+                    torch.rand(n_batch, device=self.W.device),
+                    torch.zeros((), device=self.W.device)
+                )
+            elif corr < 0:
+                corr_feat = torch.where(
+                    torch.logical_or(
+                        torch.logical_and((ind_feat != 0), (corr_sample <= -1*corr)),
+                        torch.logical_and((ind_feat == 0), corr_sample > self.feature_probability + (self.feature_probability * (self.feature_probability*-1*corr)))
+                    ),
+                    torch.zeros((), device=self.W.device),
+                    torch.rand(n_batch, device=self.W.device)
+                )
+            elif corr == 0:
+                corr_feat = torch.where(
+                    corr_sample <= self.feature_probability,
+                    torch.rand(n_batch, device=self.W.device),
+                    torch.zeros((), device=self.W.device)
+                )
+
+            corr_feats.append(corr_feat)
+
+        batch = torch.cat((ind_feat[None, :], torch.stack(corr_feats))).T
+
         return batch
 
         
@@ -80,6 +130,7 @@ class ToySAE(nn.Module):
         nn.init.xavier_normal_(self.W_dec)
         self.b_enc = nn.Parameter(torch.zeros(n_hidden, device=device))
         self.b_dec = nn.Parameter(torch.zeros(n_inputs, device=device))
+
 
     def forward(self, x, aux_loss=True):
         # features: [..., instance, n_features]
@@ -106,86 +157,67 @@ class ToySAE(nn.Module):
             top_dead_acts.scatter_(-1, deadk_res.indices, deadk_res.values)
             dead_recon = (top_dead_acts @ self.W_dec) + self.b_dec
 
-        return out, hidden, preact_feats, dead_recon
+        return {"out": out, "hidden": hidden, "preact_feats": preact_feats, "dead_recon": dead_recon}
 
 
-if __name__ == '__main__':
-    #   3 features with 0.1 freq and equal importance (1).  Data produced with seed=1.
-    #   seed 1 produces A=[0, 1],      B=[.75, .25],  C=[1, 0].
-    #   seed 2 produces A=[.75, .25],  B=[1, 0],      C=[0, 1].
-    #
-    #   ~ indicates that it is actually closer to [0.75, 0.25].
-    #   0s are in reality negatives to reduce interference, but here we're focused on activations.
-    seed = 0
-    device = f"cuda:3" if torch.cuda.is_available() else "cpu"
-    n_feats = 64
-    n_neurons = 32
-    basedir = '/home/alongon/data/toy_data/'
-    homedir = os.path.join(basedir, f'{n_feats}feats_{n_neurons}neurons_powerlaw_final')
-    Path(homedir).mkdir(parents=True, exist_ok=True)
+def generate_data(model):
+    all_batches = []
+    for i in range(steps):
+        batch = model.generate_batch(n_batch)
+        all_batches += batch.detach().cpu().numpy().tolist()
 
-    # #   GENERATE DATA, TRAIN MODEL, AND OBTAIN RAW NEURON ACTS
-    # torch.manual_seed(seed)
-    # n_batch=1024
-    # steps=10_000
-    # print_freq=1000
+    dataset = np.array(all_batches)
+    # np.save(os.path.join(basedir, f'{n_feats}feats_dataset.npy'), dataset)
+    dataset = TensorDataset(torch.tensor(dataset, dtype=torch.float))
 
-    # model = Model(n_feats, n_neurons, device)
-    # opt = torch.optim.AdamW(list(model.parameters()), lr=1e-3)
+    return dataset
 
-    # # if seed == 0:
-    # #     all_batches = []
-    # #     for i in range(steps):
-    # #         batch = model.generate_batch(n_batch)
-    # #         all_batches += batch.detach().cpu().numpy().tolist()
-    # #     np.save(os.path.join(homedir, f'/home/alongon/data/toy_data/{n_feats}feats_dataset.npy'), np.array(all_batches))
 
-    # dataset = np.load(os.path.join(basedir, f'{n_feats}feats_dataset.npy'))
-    # dataset = TensorDataset(torch.tensor(dataset, dtype=torch.float))
-    # dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+def train_model(model, dataloader):
+    opt = torch.optim.AdamW(list(model.parameters()), lr=1e-3)  
 
-    # for i, batch in enumerate(dataloader, 0):
-    #     batch = batch[0].to(device)
+    for i, batch in enumerate(dataloader, 0):
+        batch = batch[0].to(model.device)
 
-    #     out, _ = model(batch)
-    #     error = (model.importance*(batch.abs() - out)**2)
-    #     loss = error.mean()
+        out = model(batch)['out']
+        error = (model.importance*(batch.abs() - out)**2)
+        loss = error.mean()
 
-    #     loss.backward()
-    #     opt.step()
-    #     opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
 
-    #     if i % print_freq == 0 or (i + 1 == steps):
-    #         print(loss.item())
+        if i % print_freq == 0 or (i + 1 == steps):
+            print(loss.item())
 
     # torch.save(model.state_dict(), os.path.join(homedir, f'model{seed}_weights.pth'))
+    return model
 
-    # model.load_state_dict(torch.load(os.path.join(homedir, f'model{seed}_weights.pth')))
-    # model.eval()
-    # all_acts = []
-    # all_errors = []
-    # for i, batch in enumerate(dataloader, 0):
-    #     batch = batch[0].to(device)
+
+def extract_activations(model, dataloader, file_name):
+    model.eval()
+    all_acts = []
+    all_errors = []
+    for i, batch in enumerate(dataloader, 0):
+        batch = batch[0].to(model.device)
        
-    #     out, acts = model(batch)
-    #     all_acts += acts.detach().cpu().numpy().tolist()
-    #     all_errors += ((batch.abs() - out)**2).detach().cpu().numpy().tolist()
+        acts = model(batch)['hidden']
+        all_acts += acts.detach().cpu().numpy().tolist()
 
-    # np.save(os.path.join(homedir, f'model{seed}_raw_neuron_acts.npy'), np.array(all_acts))
-    # # np.save(os.path.join(homedir, f'model{seed}_recon_errors.npy'), np.array(all_errors))
-    # exit()
+    all_acts = np.array(all_acts)
+    # np.save(os.path.join(homedir, file_name), all_acts)
 
+    return all_acts
+
+
+def train_sae(acts, dataloader, device, savedir):
     #   Train SAE.
-    train_split = 0.8
     n_batch=1024
     topk = 7
     aux_alpha = 1e-1
     print_freq=1000
 
     torch.manual_seed(0)
-    data = np.load(os.path.join(homedir, f'model{seed}_raw_neuron_acts.npy'))
-    dataset = TensorDataset(torch.tensor(data[:int(data.shape[0]*0.8)], dtype=torch.float))
-    dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
 
     sae = ToySAE(n_neurons, n_feats, device, topk=topk)
     opt = torch.optim.AdamW(list(sae.parameters()), lr=1e-3)
@@ -193,7 +225,7 @@ if __name__ == '__main__':
         batch = batch[0].to(device)
         opt.zero_grad(set_to_none=True)
 
-        out, latents, preact_feats, dead_recon = sae(batch)
+        out, latents, preact_feats, dead_recon = sae(batch).values()
 
         recon_error = (batch - out)**2
         loss = recon_error.mean()
@@ -214,19 +246,90 @@ if __name__ == '__main__':
             num_dead = torch.nonzero(is_dead).shape[0]
             print(f'Num dead: {num_dead}')
 
-    torch.save(sae.state_dict(), os.path.join(homedir, f'sae{seed}_weights.pth'))
-    exit()
+    torch.save(sae.state_dict(), os.path.join(savedir, f'top{topk}_sae{seed}_weights.pth'))
+    return sae
 
-    sae.eval()
 
-    dataset = TensorDataset(torch.tensor(data[-int(data.shape[0]*(1-train_split)):], dtype=torch.float))
+def toy_align(device):
+    gen_data = False
+    basedir = '/home/alongon/data/toy_align/'
+    homedir = os.path.join(basedir, f'{n_feats}feats_{n_neurons}neurons_powerlaw_final')
+    Path(homedir).mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    model = Model(n_feats, n_neurons, device)
+
+    if gen_data:
+        dataset = generate_data(model)
+    else:
+        dataset = np.load(os.path.join(basedir, f'{n_feats}feats_dataset.npy'))
+
+    dataset = TensorDataset(torch.tensor(dataset, dtype=torch.float))
     dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+    model = train_model(model, dataloader)
+    acts = extract_activations(model, dataloader, f'model{seed}_raw_neuron_acts.npy')
 
-    all_acts = []
-    for i, batch in enumerate(dataloader, 0):
-        batch = batch[0].to(device)
-        _, latents, _, _ = sae(batch)
+    train_split = 0.8
+    dataset = TensorDataset(torch.tensor(acts[:int(acts.shape[0]*train_split)], dtype=torch.float))
+    dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+    sae = train_sae(acts, dataloader, device, homedir)
+    dataset = TensorDataset(torch.tensor(acts[-int(acts.shape[0]*(1-train_split)):], dtype=torch.float))
+    dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+    acts = extract_activations(sae, dataloader, f'model{seed}_top7_sae_acts.npy')
 
-        all_acts += latents.detach().cpu().numpy().tolist()
 
-    np.save(os.path.join(homedir, f'model{seed}_top{topk}_sae_acts.npy'), np.array(all_acts))
+def toy_arrange_converge(device):
+    basedir = '/home/alongon/data/toy_arrange_converge/'
+    homedir = os.path.join(basedir, f'{n_feats}feats_{n_neurons}neurons')
+    Path(homedir).mkdir(parents=True, exist_ok=True)
+    
+    feat1_corrs = np.arange(-1, 1.25, 0.25)
+    feat2_corrs = np.arange(-1, 1.25, 0.25)
+    num_models = 10
+    converge_grid = []
+    for feat1_corr in feat1_corrs:
+        for feat2_corr in feat2_corrs:
+            torch.manual_seed(0)
+            model = Model(n_feats, n_neurons, device, feature_corrs=[feat1_corr, feat2_corr])
+            dataset = generate_data(model)
+            dataloader = DataLoader(dataset, batch_size=n_batch, shuffle=False, drop_last=False)
+            model = train_model(model, dataloader)
+
+            model_weights = [model.state_dict()['W']]
+            weight_dir = os.path.join(homedir, f'{feat1_corr}_{feat2_corr}')
+            Path(weight_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(weight_dir, 'seed0_model_weights.pth'))
+            for train_seed in range(1, num_models):
+                torch.manual_seed(train_seed)
+                model = Model(n_feats, n_neurons, device, feature_corrs=[feat1_corr, feat2_corr])
+                model = train_model(model, dataloader)
+                model_weights.append(model.state_dict()['W'])
+                torch.save(model.state_dict(), os.path.join(weight_dir, f'seed{train_seed}_model_weights.pth'))
+
+            converge_results = []
+            for i in range(len(model_weights)):
+                for j in range(len(model_weights)):
+                    if i == j: continue
+
+                    result = pairwise_corr(model_weights[i], model_weights[j])
+                    result = torch.max(result, 1)[0].cpu().mean().numpy()
+
+                    converge_results.append(result)
+
+            converge_grid.append(np.array(converge_results).mean())
+
+    converge_grid = np.reshape(np.array(converge_grid), (feat1_corrs.shape[0], feat2_corrs.shape[0]))
+    np.save(os.path.join(homedir, 'convergence_results_grid.npy'), converge_grid)
+    print(converge_grid)
+
+
+if __name__ == '__main__':
+    seed = 0
+    device = f"cuda:5" if torch.cuda.is_available() else "cpu"
+    n_feats = 64
+    n_neurons = 8
+    n_batch = 1024
+    steps = 10000
+    print_freq=1000
+
+    toy_align(device)
+    # toy_arrange_converge(device)

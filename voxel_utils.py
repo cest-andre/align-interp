@@ -69,17 +69,17 @@ def extract_coco_ids(splits_path, nsd_root, subj_id, split=None):
 #     return subj_voxels
 
 
-def voxel_to_sae(dataloader, sae_weights, device, topk=True):
+def voxel_to_sae(dataloader, sae_weights, device, topk=False):
     all_sae_acts = []
     for _, vox in enumerate(dataloader):
         vox = vox[0].to(device)
-        vox, _, _ = LN(vox)
+        # vox, _, _ = LN(vox)
 
         acts = (vox.to(torch.float) @ sae_weights['W_enc']) + sae_weights['b_enc']
 
         #   topk activation SAE
         if topk:
-            topk_res = torch.topk(acts, k=64, dim=-1)
+            topk_res = torch.topk(acts, k=8, dim=-1)
             values = torch.nn.ReLU()(topk_res.values)
             acts = torch.zeros_like(acts, device=acts.device)
             acts.scatter_(-1, topk_res.indices, values)
@@ -92,26 +92,45 @@ def voxel_to_sae(dataloader, sae_weights, device, topk=True):
 
 
 def viz_voxels(acts, coco_dir, coco_ids, save_img_dir, device, save_count=64):
-    all_sorted_idx = sort_acts(acts, save_count)
-
+    # save_idx = [200, 1148, 1201, 1337, 1320,  231,  276, 1389,  916,  620,  702,  590,  223, 1268, 226,  715, 1247,  273,  195,  442,  421,  272, 1227,  756,  132, 1079,  900,  263, 472,  610,  470, 1317]
+    all_sorted_idx = sort_acts(acts, save_count, save_idx=None)
     for i in range(len(all_sorted_idx)):
         sorted_idx = all_sorted_idx[i]
         save_top_cocos(coco_dir, coco_ids[sorted_idx[:9]], i, save_img_dir)
 
 
-def voxel_dnn_align(splits_path, nsd_path, coco_dir, subj_id, nsd_root, dnn_acts, voxel_acts):
-    # subj_coco_ids, _ = extract_shared_for_subj(splits_path, nsd_path, subj)
-    subj_coco_ids = np.load(os.path.join(nsd_root, f'subj{subj_id}_coco_IDs.npy'))
+def voxel_dnn_align(coco_dir, subj_id, nsd_root, dnn_acts, voxel_acts, n_splits=5):
+    subj_coco_ids = np.load(os.path.join(nsd_root, 'ventral_visual_data', f'subj{subj_id}_coco_IDs.npy'))
     all_ids = [f.split('.jpg')[0] for f in os.listdir(coco_dir)]
     subj_coco_ids = [all_ids.index(str(id)) for id in subj_coco_ids]
     dnn_acts = dnn_acts[subj_coco_ids]
 
+    coeffs = None
+    x_rem_indices = None
     # scores = np.array(SemiMatching(dnn_acts.numpy().astype(np.float64), voxel_acts.numpy().astype(np.float64)))
     # scores = np.array(SoftMatching(dnn_acts.numpy().astype(np.float64), voxel_acts.numpy().astype(np.float64)))
-    # scores = np.array(RidgeRegression(dnn_acts.numpy().astype(np.float64), voxel_acts.numpy().astype(np.float64)))
-    scores = np.array(RSA(dnn_acts, voxel_acts))
+    scores, coeffs, x_rem_indices = RidgeRegression(dnn_acts.numpy().astype(np.float64), voxel_acts.numpy().astype(np.float64), n_splits=n_splits)
+    # scores = np.array(RSA(dnn_acts, voxel_acts))
 
-    return scores
+    if coeffs is not None:
+        coeffs = coeffs[0]
+
+    return scores, coeffs, x_rem_indices
+
+
+def get_nsd_surrogate_sae(data_dir, save_dir, coco_dir, subj_id, nsd_root, dnn_acts, voxels):
+    model = 'resnet50'
+    layer = 'layer4.2'
+    dnn_opt_topk = {'k': 41, 'epoch': 300, 'exp': 2}
+
+    source_sae_acts = torch.tensor(
+        np.load(os.path.join(basedir, 'coco_acts', model, 'sae_latents', layer, f'top{dnn_opt_topk["k"]}_aux_{dnn_opt_topk["exp"]}exp_sae_weights_{dnn_opt_topk["epoch"]}ep.npy'))
+    )
+    voxel_acts = torch.tensor(
+        np.load(os.path.join(nsd_root, 'ventral_visual_data', f'subj{subj_id}.npy'))
+    )
+    align_scores, coeffs, x_rem_indices = voxel_dnn_align(coco_dir, subj_id, nsd_root, dnn_acts, voxels, n_splits=2)
+    np.save(os.path.join(save_dir, f'{model}_{layer}_top{dnn_opt_topk["k"]}_{dnn_opt_topk["exp"]}exp_sae_weights_{dnn_opt_topk["epoch"]}ep_linreg_coeff.npy'), coeffs)
 
 
 #   Use kmeans to reduce redundant voxels.  Plot voxels in the space of activations across all stimuli (all subject's NSD responses).
@@ -138,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument('--splits_path', type=str)
     parser.add_argument('--nsd_root', type=str)
     parser.add_argument('--brain_region', type=str)
+    parser.add_argument('--kmeans_subset', type=str, default=None)
     parser.add_argument('--save_acts_dir', type=str)
     parser.add_argument('--save_img_dir', type=str)
     parser.add_argument('--subj_id', type=int)
@@ -148,29 +168,42 @@ if __name__ == "__main__":
     parser.add_argument('--reduce_k', type=int, default=0)
     args = parser.parse_args()
 
-    # subj_voxels = extract_train_for_subj(args.splits_path, args.nsd_path, args.savedir, args.subj_id)
-
-    # file_name = f'subj_{args.subj_id}_'
+    # subj_voxels = np.load(os.path.join(args.nsd_root, f'{args.brain_region}_data', f'subj{args.subj_id}.npy'))
+    # file_name = f'subj{args.subj_id}_'
     # if args.reduce_k > 0:
-    #     filtered_idx = kmeans_voxel_reduce(subj_voxels, args.savedir, args.subj_id, k=args.reduce_k)
+    #     filtered_idx = kmeans_voxel_reduce(subj_voxels, args.save_acts_dir, args.subj_id, k=args.reduce_k)
     #     subj_voxels = subj_voxels[:, filtered_idx]
     #     file_name += f'{args.reduce_k}means_filtered_'
 
     # file_name += 'train_voxels.npy'
     # print(subj_voxels.shape)
-    # np.save(os.path.join(args.savedir, file_name), subj_voxels)
+    # np.save(os.path.join(args.save_acts_dir, file_name), subj_voxels)
     # exit()
 
 
     #   Extract voxel sae latent acts
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     subj_voxels = np.load(os.path.join(args.nsd_root, f'{args.brain_region}_data', f'subj{args.subj_id}.npy'))
+    if args.kmeans_subset is not None:
+        kmeans_idx = np.load(args.kmeans_subset)
+        print(kmeans_idx[-32:])
+        subj_voxels = subj_voxels[:, kmeans_idx]
+
+    subj_voxels, _, _ = LN(torch.tensor(subj_voxels))
+    subj_voxels = subj_voxels.numpy()
+
     voxel_ds = TensorDataset(torch.tensor(subj_voxels))
     dataloader = DataLoader(voxel_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    sae_weights = torch.load(os.path.join(args.sae_weights_dir, f'{args.brain_region}', f'subj{args.subj_id}', f'{args.sae_name}.pth'))
-    sae_weights['W_enc'] = sae_weights['W_enc'].to(device)
-    sae_weights['b_enc'] = sae_weights['b_enc'].to(device)
+    # sae_weights = torch.load(os.path.join(args.sae_weights_dir, f'{args.brain_region}', f'subj{args.subj_id}', f'{args.sae_name}.pth'))
+    # sae_weights['W_enc'] = sae_weights['W_enc'].to(device)
+    # sae_weights['b_enc'] = sae_weights['b_enc'].to(device)
+
+    sae_weights = {}
+    sae_weights['W_enc'] = torch.tensor(
+        np.load(os.path.join(args.sae_weights_dir, f'{args.brain_region}', f'subj{args.subj_id}', f'{args.sae_name}.npy'))
+    ).to(device).to(torch.float)
+    sae_weights['b_enc'] = torch.zeros(sae_weights['W_enc'].shape[1]).to(device).to(torch.float)
 
     save_acts_dir = os.path.join(args.save_acts_dir, f'{args.brain_region}', f'subj{args.subj_id}', 'voxel_sae_acts')
     Path(save_acts_dir).mkdir(parents=True, exist_ok=True)
