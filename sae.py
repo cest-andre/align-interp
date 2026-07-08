@@ -195,68 +195,128 @@ class SAE(nn.Module):
         super().train(mode)
 
 
-#   TODO:  SCRAPPED UNTIL RESIDUAL STREAM HAS BEEN IMPLEMENTED (is it not already implemented within model.layerX modules?).
-#
-#   Wrapper so that we have control over the forward pass.
-# class ModelWrapper(nn.Module):
-#     target_neuron = None
-#     all_acts = []
+class BezierSAE(nn.Module):
+    def __init__(self, input_dims, num_curves, topk, dtype=torch.float, device="cpu", init_ctrl_data=None, num_t_samples=None):
+        super().__init__()
 
-#     def __init__(self, model, expansion, device, use_sae=False, input_dims=None):
-#         super().__init__()
-#         self.device = device
-#         self.block_output = None
+        self.input_dims = input_dims
+        self.num_curves = num_curves
+        self.topk = topk
+        self.num_t_samples = num_t_samples
 
-#         self.block_input = nn.Sequential()
-#         self.block_input.append(model.conv1)
-#         self.block_input.append(model.bn1)
-#         self.block_input.append(model.relu)
-#         self.block_input.append(model.maxpool)
-#         self.block_input.append(model.layer1)
-#         self.block_input.append(model.layer2)
+        self.dtype = dtype
+        self.device = device
 
-#         # self.block_input.append(model.layer3[:5])
-#         # self.block_output = nn.Sequential()
-#         # self.block_output.append(model.layer3[5].conv1)
-#         # self.block_output.append(model.layer3[5].bn1)
-#         # self.block_output.append(model.layer3[5].relu)
-#         # self.block_output.append(model.layer3[5].conv2)
-#         # self.block_output.append(model.layer3[5].bn2)
-#         # self.block_output.append(model.layer3[5].relu)
-#         # self.block_output.append(model.layer3[5].conv3)
-#         # self.block_output.append(model.layer3[5].bn3)
+        if num_t_samples is not None:
+            self.encode = self.encode_t_sample
+        else:
+            self.encode = self.encode_mask
 
-#         self.block_input.append(model.layer3)
-#         self.block_input.append(model.layer4[0])
-#         self.block_input.append(model.layer4[1].conv1)
-#         self.block_input.append(model.layer4[1].bn1)
-#         self.block_input.append(model.layer4[1].relu)
-#         self.block_input.append(model.layer4[1].conv2)
-#         self.block_input.append(model.layer4[1].bn2)
+        self.init_weights(init_ctrl_data=init_ctrl_data)
 
-#         self.use_sae = use_sae
-#         if self.use_sae:
-#             assert input_dims != None
-#             self.map = nn.Linear(input_dims, input_dims*expansion, bias=False)
 
-#     def forward(self, x, relu=False, center=False):
-#         x = x.to(self.device)
-#         x = self.block_input(x)
+    def init_weights(self, init_ctrl_data=None):
+        # self.mask_enc = nn.Parameter(
+        #     torch.nn.init.kaiming_uniform_(
+        #         torch.empty(
+        #             self.input_dims, self.num_curves, dtype=self.dtype, device=self.device
+        #         )
+        #     )
+        # )
 
-#         if self.block_output is not None:
-#             presum_out = self.block_output(x)
-#             x = x + presum_out
+        # self.t_enc = nn.Parameter(
+        #     torch.nn.init.kaiming_uniform_(
+        #         torch.empty(
+        #             self.input_dims, self.num_curves, dtype=self.dtype, device=self.device
+        #         )
+        #     )
+        # )
 
-#         if relu:
-#             x = nn.ReLU(inplace=True)(x)
+        if init_ctrl_data is not None:
+            #   TODO:  for each curve, randomly select one data point and its two nearest neighbors.
+            pass
+        else:
+            #   NOTE:  each curve has three control points.  These are stacked into columns in this weight matrix, ordered START, CENTER, END.
+            self.ctrl_points = nn.Parameter(
+                torch.nn.init.kaiming_uniform_(
+                    torch.empty(
+                        self.num_curves, 3 * self.input_dims, dtype=self.dtype, device=self.device
+                    )
+                )
+            )
 
-#         # x = torch.mean(torch.flatten(x, start_dim=-2), dim=-1)
-#         if center:
-#             center_coord = x.shape[-1] // 2
-#             x = x[:, :, center_coord, center_coord]
 
-#             if self.use_sae:
-#                 x = self.map(x)
-#                 x = x[:, :, None, None]
+    def encode_mask(self, x):
+        mask = x @ self.mask_enc
 
-#         return x
+        topk_res = torch.topk(mask, k=self.topk, dim=-1)
+        mask = torch.zeros_like(mask, device=self.device)
+        mask.scatter_(-1, topk_res.indices, torch.ones(topk_res.values.shape, dtype=self.dtype, device=self.device))
+
+        t_params = mask * (nn.Sigmoid()(x @ self.t_enc))
+
+        return mask, t_params
+
+
+    #   TODO:  for each active curve, sample points along curve uniformly, define t values to be equal num_samples intervals [0,1].
+    #          for each sample, compute point and that point's distance to x.  pick the t value closest to x for all active curves (for all data
+    #          in batch).
+    #
+    #          I think I need to disable grads for this step.  Make sure to reenable t selection is complete.  This may require wasted computation
+    #          as the correct t will be computed twice (once for selection, another for final decoding), but hopefully it won't be too slow.
+    #
+    #   ***    Might be easier to just compute t for each curve for each x in batch.  Then masking over num_curves will take care of the rest.
+    #          While I'm doing it, why not just eliminate mask encoding entirely and just pick the top-k curves that have a t param closest to x?
+    #          That will define the mask.  For each curve, find min distance t.  Then for each curve(min_t), find k min distances with x.
+    def encode_t_sample(self, x):
+        with torch.no_grad():
+            t_params = torch.arange(self.num_t_samples + 1, device=self.device) / self.num_t_samples
+            t_params = torch.broadcast_to(t_params[None, None, :, None], (x.shape[0], self.num_curves, t_params.shape[0], self.input_dims))
+
+            bc_curves = torch.reshape(self.ctrl_points, (self.ctrl_points.shape[0], 3, self.ctrl_points.shape[1] // 3))
+            bc_curves = torch.broadcast_to(bc_curves[None, :, None, :, :], (x.shape[0], bc_curves.shape[0], t_params.shape[2], bc_curves.shape[1], bc_curves.shape[2]))
+
+            #   NOTE:  bc_curves shape: (batch, num_curves, num_t_samples+1, 3, input_dims)
+            curve_dists = (bc_curves[:, :, :, 0] * (1 - t_params)**2) + (bc_curves[:, :, :, 1] * 2 * t_params * (1 - t_params)) + (bc_curves[:, :, :, 2] * t_params**2)
+            curve_dists = torch.sqrt(torch.sum((torch.broadcast_to(x[:, None, None, :], (x.shape[0], self.num_curves, t_params.shape[2], x.shape[1])) - curve_dists) ** 2, dim=-1))
+
+            #   TODO: select top 1 t_samples for each curve in each batch as final t_params.  then top k over curves dim for final mask.
+            #         SHOULD NONE OF THIS HAVE GRADIENTS???
+            min_ts = torch.argmin(curve_dists, dim=-1)
+            t_params = t_params[
+                torch.broadcast_to(torch.arange(t_params.shape[0])[:, None], t_params.shape[:2]),
+                torch.broadcast_to(torch.arange(t_params.shape[1])[None, :], t_params.shape[:2]),
+                min_ts,
+                0
+            ]
+
+            curve_dists = curve_dists[
+                torch.broadcast_to(torch.arange(curve_dists.shape[0])[:, None], curve_dists.shape[:2]),
+                torch.broadcast_to(torch.arange(curve_dists.shape[1])[None, :], curve_dists.shape[:2]),
+                min_ts
+            ]
+            topk_res = torch.topk(curve_dists, k=self.topk, largest=False, dim=-1)
+            mask = torch.zeros((x.shape[0], self.num_curves), device=self.device)
+            mask.scatter_(-1, topk_res.indices, torch.ones(topk_res.values.shape, dtype=self.dtype, device=self.device))
+
+        return mask, t_params
+
+
+    def decode(self, mask, t_params):
+        mask = torch.broadcast_to(mask[:, :, None], (mask.shape[0],) + tuple(self.ctrl_points.shape))  # broadcast mask across input_dim of ctrl_points
+        masked_ctrls = torch.broadcast_to(self.ctrl_points[None, :, :], mask.shape)  # broadcast ctrl points to batch dimension for per-example masking
+        masked_ctrls = torch.reshape(mask * masked_ctrls, (masked_ctrls.shape[0], masked_ctrls.shape[1], 3, masked_ctrls.shape[2] // 3))
+
+        t_params = torch.broadcast_to(t_params[:, :, None], tuple(t_params.shape) + (masked_ctrls.shape[-1],))  # broadcast mask across input_dim of ctrl_points
+
+        x_hat = (masked_ctrls[:, :, 0] * (1 - t_params)**2) + (masked_ctrls[:, :, 1] * 2 * t_params * (1 - t_params)) + (masked_ctrls[:, :, 2] * t_params**2)
+        x_hat = torch.sum(x_hat, 1)
+
+        return x_hat
+
+
+    def forward(self, x):
+        mask, t_params = self.encode(x)
+        x_hat = self.decode(mask, t_params)
+
+        return x_hat

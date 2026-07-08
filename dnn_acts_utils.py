@@ -61,7 +61,12 @@ def get_vit_acts(extractor, x, module_name, use_cls_token=False):
     return acts
 
 
-def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weights=None, batch_size=2048):
+def get_img_acts(
+    model, img_dir, layer_name, device,
+    return_imgs=False, batch_size=2048,
+    sae_weights=None, linreg_data=None,
+    bezier_weights=None, bezier_t=None
+):
     IMAGE_SIZE = 224
     # specify ImageNet mean and standard deviation (use for all image datasets such as coco?)
     MEAN = [0.485, 0.456, 0.406]
@@ -127,6 +132,25 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
 
             acts = torch.nn.ReLU()(acts)
 
+        if linreg_data is not None:
+            acts, _, _ = LN(acts[:, linreg_data['keep_idx']])
+            acts = (acts @ linreg_data['coeffs'].T)
+
+        if bezier_weights is not None:
+            acts, _, _ = LN(acts)
+
+            #   Init t_params as same constant (0, 0.25, .5, 0.75, or 1) for all num_curves.
+            #   Compute positions for curve(t) for all curves and transpose to obtain (model_dim, num_curves) tensor.
+            #   Compute acts @ curve(t).T (or euclid distance??) to get dictionary "activations" (proximity of image act
+            #   to all the points along curve at t).
+            ctrl_points = bezier_weights['ctrl_points']
+            ctrl_points = torch.reshape(ctrl_points, (ctrl_points.shape[0], 3, ctrl_points.shape[1] // 3))
+            t_params = torch.full((ctrl_points.shape[0], ctrl_points.shape[-1]), bezier_t, device=device) 
+
+            curve_points = (ctrl_points[:, 0] * (1 - t_params)**2) + (ctrl_points[:, 1] * 2 * t_params * (1 - t_params)) + (ctrl_points[:, 2] * t_params**2)
+
+            acts = acts @ curve_points.T
+
         all_acts += acts.detach().cpu().numpy().tolist()
         
     if return_imgs:
@@ -135,16 +159,24 @@ def get_img_acts(model, img_dir, layer_name, device, return_imgs=False, sae_weig
     return all_acts, all_imgs
 
 
-def save_top_act_imgs(extractor, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size, sae_weights=None, sae_name=None):
-    all_acts, all_imgs = get_img_acts(extractor, imnet_dir, layer_name, device, return_imgs=True, sae_weights=sae_weights, batch_size=batch_size)
+def save_top_act_imgs(
+    extractor, imnet_dir, layer_name, save_act_dir, save_img_dir, device, batch_size,
+    sae_weights=None, sae_name=None, bezier_weights=None, bezier_t=None
+):
+    all_acts, all_imgs = get_img_acts(
+        extractor, imnet_dir, layer_name, device,
+        return_imgs=True, batch_size=batch_size,
+        bezier_weights=bezier_weights, bezier_t=bezier_t
+    )
 
     if save_act_dir is not None:
         Path(save_act_dir).mkdir(parents=True, exist_ok=True)
         np.save(os.path.join(save_act_dir, f'{layer_name if sae_name is None else sae_name}.npy'), np.array(all_acts))
 
-    save_count = 64
-    # save_idx = [634, 1463,  200, 1284,  947,  753,  337,  201,  367,  500, 1313,  762,  869,  638,  855, 874]
-    all_sorted_idx = sort_acts(all_acts, save_count, save_idx=None)
+    save_count = 32
+    # save_idx = [270,  265,   40, 1471, 1498, 1308,  220,  352,  696, 1307,  145,  869, 1426,  878,  670,  100]
+    save_idx = None
+    all_sorted_idx = sort_acts(all_acts, save_count, save_idx=save_idx)
     for i in range(len(all_sorted_idx)):
         sorted_idx = all_sorted_idx[i]
         save_top_imgs(all_imgs[sorted_idx[:9]], save_img_dir, i)
@@ -190,7 +222,12 @@ if __name__ == '__main__':
     parser.add_argument('--layer_name', type=str, default='')
     parser.add_argument('--sae_name', type=str, default=None)
     parser.add_argument('--sae_weights_dir', type=str, default=None)
+    parser.add_argument('--linreg_coeffs', type=str, default=None)
+    parser.add_argument('--linreg_rmv_idx', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--bezier_weights_dir', type=str, default=None)
+    parser.add_argument('--bezier_name', type=str, default=None)
+    parser.add_argument('--bezier_t', type=float, default=None)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
 
@@ -198,9 +235,9 @@ if __name__ == '__main__':
 
     from thingsvision import get_extractor
 
-    # model_name = 'resnet50'
-    # param_name = {'weights': 'IMAGENET1K_V2'}
-    # source = 'torchvision'
+    model_name = 'resnet50'
+    param_name = {'weights': 'IMAGENET1K_V2'}
+    source = 'torchvision'
 
     # model_name = 'resnet18'
     # param_name = {'weights': 'IMAGENET1K_V1'}
@@ -209,9 +246,9 @@ if __name__ == '__main__':
     # param_name = {'weights': 'IMAGENET1K_V1'}
     # source = 'torchvision'
 
-    model_name = 'clip'
-    param_name = {'variant': 'ViT-B/32'}
-    source = 'custom'
+    # model_name = 'clip'
+    # param_name = {'variant': 'ViT-B/32'}
+    # source = 'custom'
 
     extractor = get_extractor(
         model_name=model_name,
@@ -263,19 +300,35 @@ if __name__ == '__main__':
         if args.save_img_dir is not None:
             save_img_dir = os.path.join(args.save_img_dir, args.layer_name)
 
-    # all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, sae_weights=sae_states, batch_size=args.batch_size)
-    # # np.save(os.path.join(save_act_dir, f'{args.layer_name if args.sae_name is None else args.sae_name}.npy'), np.array(all_acts))
-    # np.save(os.path.join(save_act_dir, f'{args.layer_name}_train.npy'), np.array(all_acts))
+    linreg_data = None
+    if args.linreg_coeffs is not None:
+        keep_idx = np.arange(sae_states['b_enc'].shape[0])
+        keep_idx = np.delete(keep_idx, np.load(args.linreg_rmv_idx))
+        linreg_data = {
+            'coeffs': torch.tensor(np.load(args.linreg_coeffs), dtype=torch.float).to(device),
+            'keep_idx': keep_idx
+        }
 
-    Path(save_img_dir).mkdir(parents=True, exist_ok=True)
-    save_top_act_imgs(
-        extractor,
-        args.img_dir,
-        args.layer_name,
-        save_act_dir,
-        save_img_dir,
-        device,
-        args.batch_size,
-        sae_weights=sae_states,
-        sae_name=args.sae_name
-    )
+    if args.bezier_weights_dir is not None:
+        bezier_weights = torch.load(os.path.join(args.bezier_weights_dir, f'{args.bezier_name}.pth'), map_location='cpu')
+        bezier_weights['ctrl_points'] = bezier_weights['ctrl_points'].to(device)
+
+        save_img_dir = os.path.join(args.save_img_dir, args.layer_name, args.bezier_name, f't={args.bezier_t}')
+
+    # all_acts, _ = get_img_acts(extractor, args.img_dir, args.layer_name, device, batch_size=args.batch_size)
+    # np.save(os.path.join(save_act_dir, f'{args.layer_name}_train.npy'), np.array(all_acts))
+    # exit()
+
+    if args.save_img_dir is not None:
+        Path(save_img_dir).mkdir(parents=True, exist_ok=True)
+        save_top_act_imgs(
+            extractor,
+            args.img_dir,
+            args.layer_name,
+            save_act_dir,
+            save_img_dir,
+            device,
+            args.batch_size,
+            bezier_weights=bezier_weights,
+            bezier_t=args.bezier_t
+        )

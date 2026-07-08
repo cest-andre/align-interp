@@ -9,7 +9,7 @@ from scipy.stats import kendalltau, pearsonr
 from scipy.io import loadmat
 import ot
 from sklearn.model_selection import KFold
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import RidgeCV, LinearRegression
 
 from sae import LN
 
@@ -19,6 +19,19 @@ from sae import LN
 #     results = snmf()
 
 #     return results.basis()
+
+
+def menger_curvature(p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # Edge lengths (sides of the triangle)
+    a = torch.norm(p1 - p2, dim=-1)
+    b = torch.norm(p2 - p3, dim=-1)
+    c = torch.norm(p3 - p1, dim=-1)
+    s = (a + b + c) / 2.0
+    
+    area = torch.sqrt(torch.clamp(s * (s - a) * (s - b) * (s - c), min=0.0))
+    curvature = (4.0 * area) / (a * b * c + eps)
+    
+    return curvature
 
 
 def sort_acts(all_acts, save_count, save_idx=None):
@@ -45,7 +58,7 @@ def save_top_imgs(top_imgs, savedir, unit_id, bot_imgs=None):
 
     grid = utils.make_grid(top_imgs, nrow=3)
     grid = transforms.ToPILImage()(grid)
-    grid.save(os.path.join(grids_path, f"{unit_id}_vinken.png"))
+    grid.save(os.path.join(grids_path, f"{unit_id}.png"))
 
     if bot_imgs is not None:
         bot_grids_path = os.path.join(path, "bot_grids")
@@ -182,14 +195,18 @@ def cdist(X,Y):
 def remove_dead_units(X, Y, kf):
     x_rem_indices = np.array([], dtype=np.int32)
     y_rem_indices = np.array([], dtype=np.int32)
-    for i, (train_idx, test_idx) in enumerate(kf.split(X)):
-        x_train, x_test = X[train_idx], X[test_idx]        
-        x_rem_indices = np.unique(np.concatenate((x_rem_indices, np.all(x_train == 0, axis=0).nonzero()[0])))
-        x_rem_indices = np.unique(np.concatenate((x_rem_indices, np.all(x_test == 0, axis=0).nonzero()[0])))
+    if kf is None:
+        x_rem_indices = np.all(X == 0, axis=0).nonzero()[0]
+        y_rem_indices = np.all(Y == 0, axis=0).nonzero()[0]
+    else:
+        for i, (train_idx, test_idx) in enumerate(kf.split(X)):
+            x_train, x_test = X[train_idx], X[test_idx]        
+            x_rem_indices = np.unique(np.concatenate((x_rem_indices, np.all(x_train == 0, axis=0).nonzero()[0])))
+            x_rem_indices = np.unique(np.concatenate((x_rem_indices, np.all(x_test == 0, axis=0).nonzero()[0])))
 
-        y_train, y_test = Y[train_idx], Y[test_idx]
-        y_rem_indices = np.unique(np.concatenate((y_rem_indices, np.all(y_train == 0, axis=0).nonzero()[0])))
-        y_rem_indices = np.unique(np.concatenate((y_rem_indices, np.all(y_test == 0, axis=0).nonzero()[0])))
+            y_train, y_test = Y[train_idx], Y[test_idx]
+            y_rem_indices = np.unique(np.concatenate((y_rem_indices, np.all(y_train == 0, axis=0).nonzero()[0])))
+            y_rem_indices = np.unique(np.concatenate((y_rem_indices, np.all(y_test == 0, axis=0).nonzero()[0])))
 
     X, Y = np.delete(X, x_rem_indices, axis=1), np.delete(Y, y_rem_indices, axis=1)
     
@@ -231,6 +248,14 @@ def SemiMatching(X, Y):
 
 def SoftMatching(X, Y, itermax=1000):
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    print('BEFORE DEAD REMOVAL')
+    print(X.shape)
+    print(Y.shape)
+    X, Y, x_rem_indices = remove_dead_units(X, Y, kf)
+    print('AFTER DEAD REMOVAL')
+    print(X.shape)
+    print(Y.shape)
+    print('\n')
 
     scores = []
     for i, (train_idx, test_idx) in enumerate(kf.split(X)):
@@ -278,12 +303,13 @@ def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
     print(X.shape)
     print(Y.shape)
     print('\n')
-    X, _, _ = LN(torch.tensor(X))
-    X = X.numpy()
-    Y, _, _ = LN(torch.tensor(Y))
-    Y = Y.numpy()
+    # X, _, _ = LN(torch.tensor(X))
+    # X = X.numpy()
+    # Y, _, _ = LN(torch.tensor(Y))
+    # Y = Y.numpy()
 
-    scores = []
+    train_scores = []
+    val_scores = []
     var_exps = []
     mses = []
     all_coeffs = []
@@ -291,10 +317,10 @@ def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
         x_train, x_test = X[train_idx], X[test_idx]
         y_train, y_test = Y[train_idx], Y[test_idx]
 
-        # x_train = x_train - x_train.mean(axis=0)
-        # # x_train = x_train / np.sqrt(np.sum(x_train**2, axis=0))
-        # y_train = y_train - y_train.mean(axis=0)
-        # # y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
+        x_train = x_train - x_train.mean(axis=0)
+        x_train = x_train / np.sqrt(np.sum(x_train**2, axis=0))
+        y_train = y_train - y_train.mean(axis=0)
+        y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
 
         # x_train, _, _ = LN(torch.tensor(x_train))
         # x_train = x_train.numpy()
@@ -302,6 +328,7 @@ def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
         # y_train = y_train.numpy()
 
         predictor = RidgeCV(alphas=np.logspace(alpha_min, alpha_max, num_alpha), fit_intercept=False)
+        # predictor = LinearRegression(fit_intercept=False, n_jobs=32)
         predictor.fit(x_train, y_train)
 
         all_coeffs.append(predictor.coef_)
@@ -311,8 +338,8 @@ def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
         # y_train = y_train / np.sqrt(np.sum(y_train**2, axis=0))
         # sim_matrix = 1 - cdist(y_train, y_pred)
         
-        # x_test = x_test - x_test.mean(axis=0)
-        # x_test = x_test / np.sqrt(np.sum(x_test**2, axis=0))
+        x_test = x_test - x_test.mean(axis=0)
+        x_test = x_test / np.sqrt(np.sum(x_test**2, axis=0))
         # y_test = y_test - y_test.mean(axis=0)
         # y_test = y_test / np.sqrt(np.sum(y_test**2, axis=0))
 
@@ -320,11 +347,21 @@ def RidgeRegression(X, Y, alpha_min=-8, alpha_max=8, num_alpha=17, n_splits=5):
         mse = np.mean(np.sum((y_pred - y_test)**2, axis=1))
         mses.append(mse)
 
+        # y_pred = y_pred - y_pred.mean(axis=0)
         y_pred = y_pred / np.sqrt(np.sum(y_pred**2, axis=0))
+        y_test = y_test - y_test.mean(axis=0)
         y_test = y_test / np.sqrt(np.sum(y_test**2, axis=0))
         sim_matrix = 1 - cdist(y_test, y_pred)
-        scores.append(np.mean(np.diag(sim_matrix)))
+        val_scores.append(np.mean(np.diag(sim_matrix)))
 
-        var_exps.append(var_explained(torch.tensor(y_test), torch.tensor(y_pred)))
+        y_pred = predictor.predict(x_train)
+        y_pred = y_pred - y_pred.mean(axis=0)
+        y_pred = y_pred / np.sqrt(np.sum(y_pred**2, axis=0))
+        sim_matrix = 1 - cdist(y_train, y_pred)
+        train_scores.append(np.mean(np.diag(sim_matrix)))
 
-    return scores, all_coeffs, x_rem_indices#, var_exps, mses
+        # var_exps.append(var_explained(torch.tensor(y_test), torch.tensor(y_pred)))
+
+    noise_ceiling = np.load('/home/alongon/data/nsd/ventral_visual/noise_ceilings/noise_ceilings_NSD.npy', allow_pickle=True)[()][1].mean()
+    print(f'TRAIN SCORE:  {np.array(train_scores).mean() / noise_ceiling}')
+    return val_scores#, all_coeffs, x_rem_indices#, var_exps, mses

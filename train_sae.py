@@ -7,7 +7,7 @@ from torch import optim
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.cluster import KMeans
 
-from sae import SAE, LN
+from sae import SAE, BezierSAE, LN
 
 
 if __name__ == "__main__":
@@ -23,6 +23,7 @@ if __name__ == "__main__":
     parser.add_argument('--topk', type=int, default=0)
     parser.add_argument('--num_input_dims', type=int, default=0)
     parser.add_argument('--archetype_k', type=int, default=0)  # value used in paper = 32000
+    parser.add_argument('--num_curves', type=int, default=0)
     parser.add_argument('--device', type=int)
     args = parser.parse_args()
     assert args.start_epoch < args.epochs
@@ -61,22 +62,22 @@ if __name__ == "__main__":
     lr = 0.0004
     adam_beta1 = 0.9
     adam_beta2 = 0.999
-    aux_alpha = 1e-4
-    l1_lambda = 2
-    mse_scale = (
-        1 / ((acts_data.float().mean(dim=0) - acts_data.float()) ** 2).mean()
-    )
+    aux_alpha = 1#e-1
+    l1_lambda = 1#e-5
 
-    sae = SAE(
-        num_dims,
-        args.expansion,
-        topk=args.topk if args.topk > 0 else None,
-        auxk=int(num_dims * args.expansion),
-        dead_steps_threshold=32,
-        device=device,
-        enc_data=None,
-        archetypes=archetypes
-    ).to(device)
+    if args.num_curves > 0:
+        sae = BezierSAE(num_dims, args.num_curves, args.topk, num_t_samples=10, device=device).to(device)
+    else:
+        sae = SAE(
+            num_dims,
+            args.expansion,
+            topk=args.topk if args.topk > 0 else None,
+            auxk=int(num_dims * args.expansion),
+            dead_steps_threshold=128,
+            device=device,
+            enc_data=None,
+            archetypes=archetypes
+        ).to(device)
 
     optimizer = optim.Adam(
         sae.parameters(),
@@ -88,7 +89,7 @@ if __name__ == "__main__":
         eps=6.25e-10
     )
 
-    label = f'top{args.topk}_aux_{args.expansion}exp' if args.topk > 0 else f'vanilla_2lambda_{args.expansion}exp'
+    label = f'bezier_t_sample_dist_loss_top{args.topk}_{args.num_curves}_curves' if args.topk > 0 else f'vanilla_1lambda_{args.expansion}exp'
     # torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_randinit.pth")
     # exit()
 
@@ -99,43 +100,55 @@ if __name__ == "__main__":
     all_mses = []
     mse = torch.nn.functional.mse_loss
     for ep in range(args.start_epoch, args.epochs):
-        print(f"Epoch {ep}")
+        print(f"Epoch {ep+1}")
         total_mse = 0
         total_l1 = 0
         total_dead = 0
+        total_curve_loss = 0
         for i, acts in enumerate(dataloader, 0):
             optimizer.zero_grad()
 
             acts = acts[0].to(device)
-            latents, acts_hat, preact_feats, dead_acts_recon, num_dead = sae(acts)
-
+            # latents, acts_hat, preact_feats, dead_acts_recon, num_dead = sae(acts)
+            acts_hat = sae(acts)
             mse_loss = mse(acts_hat, acts, reduction="none").sum(-1)
-            weighted_latents = latents * sae.W_dec.norm(dim=1)
-            sparsity = weighted_latents.norm(p=1, dim=-1)
+
+            # weighted_latents = latents * sae.W_dec.norm(dim=1)
+            # sparsity = weighted_latents.norm(p=1, dim=-1)
 
             total_mse += mse_loss.mean().cpu().detach().numpy()
-            total_l1 += sparsity.mean().cpu().detach().numpy()
+            # total_l1 += sparsity.mean().cpu().detach().numpy()
 
             loss = mse_loss.mean()
 
-            # #   REANIMATE LOSS!!!  Credit to Thomas Fel
-            # is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
-            # total_dead += torch.nonzero(is_dead).shape[0]
-            # # we push the pre_codes (before relu) towards the positive orthant
-            # reanim_loss = (preact_feats * is_dead[None, :]).mean()
+            if args.num_curves > 0:
+                #   TODO:  take mean distance between the three control points for each curve, mean across curves to
+                #          get a "curve distance error".  Multiple by aux_alpha and add to loss.
+                points = torch.reshape(sae.ctrl_points, (sae.ctrl_points.shape[0], 3, sae.ctrl_points.shape[1] // 3))
+                curve_dist_loss = (torch.norm(points[:, 0, :] - points[:, 1, :], dim=1) + torch.norm(points[:, 1, :] - points[:, 2, :], dim=1)).mean()
 
-            # loss -= reanim_loss * 1e-3
+                # loss += aux_alpha * curve_dist_loss
 
-            #  Auxiliary loss (prevents dead latents)
-            if dead_acts_recon is not None:
-                total_dead += num_dead
-                error = acts - acts_hat
-                aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1)# / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
-                aux_loss = aux_alpha * aux_mse.nan_to_num(0)
+                total_curve_loss += curve_dist_loss.mean().cpu().detach().numpy()
 
-                loss += aux_loss.mean()
+            # # #   REANIMATE LOSS!!!  Credit to Thomas Fel
+            # # is_dead = ((latents > 0).sum(dim=0) == 0).float().detach()
+            # # total_dead += torch.nonzero(is_dead).shape[0]
+            # # # we push the pre_codes (before relu) towards the positive orthant
+            # # reanim_loss = (preact_feats * is_dead[None, :]).mean()
 
-            # loss += l1_lambda * sparsity.mean()
+            # # loss -= reanim_loss * 1e-3
+
+            # #  Auxiliary loss (prevents dead latents for TopK)
+            # if dead_acts_recon is not None:
+            #     total_dead += num_dead
+            #     error = acts - acts_hat
+            #     aux_mse = mse(dead_acts_recon, error, reduction="none").sum(-1)# / mse(error.mean(dim=0)[None, :].broadcast_to(error.shape), error, reduction="none").sum(-1)
+            #     aux_loss = aux_alpha * aux_mse.nan_to_num(0)
+
+            #     loss += aux_loss.mean()
+
+            # # loss += l1_lambda * sparsity.mean()
 
             loss.backward()
             optimizer.step()
@@ -145,10 +158,11 @@ if __name__ == "__main__":
 
         print(f"Average mse:  {total_mse / i}")
         all_mses.append(total_mse / i)
+        print(f"Average Curve Loss:  {total_curve_loss / i}")
         print(f"Average L1:  {total_l1 / i}")
         print(f"Average Dead: {total_dead / i}")
 
-        if (ep+1) % 500 == 0:
+        if (ep+1) % 10 == 0:
             torch.save(sae.state_dict(), f"{args.ckpt_dir}/{label}_sae_weights_{ep+1}ep.pth")
             torch.save(optimizer.state_dict(), f"{args.ckpt_dir}/{label}_opt_states_{ep+1}ep.pth")
         
